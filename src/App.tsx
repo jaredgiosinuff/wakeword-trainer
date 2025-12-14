@@ -58,6 +58,29 @@ const getVoterId = () => {
   return voterId
 }
 
+// Session persistence
+const SESSION_STORAGE_KEY = 'wakeword_session'
+
+const saveSession = (session: Session | null) => {
+  if (session) {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session))
+  } else {
+    localStorage.removeItem(SESSION_STORAGE_KEY)
+  }
+}
+
+const loadSavedSession = (): Session | null => {
+  try {
+    const saved = localStorage.getItem(SESSION_STORAGE_KEY)
+    if (saved) {
+      return JSON.parse(saved)
+    }
+  } catch (e) {
+    console.error('Failed to load saved session:', e)
+  }
+  return null
+}
+
 // Tooltip component
 function Tooltip({ children, text }: { children: React.ReactNode; text: string }) {
   const [show, setShow] = useState(false)
@@ -208,6 +231,60 @@ function App() {
     }
   }, [])
 
+  // Restore session from localStorage on mount
+  useEffect(() => {
+    const restoreSession = async () => {
+      const saved = loadSavedSession()
+      if (saved) {
+        try {
+          // Verify session still exists on server
+          const response = await fetch(`${API_BASE}/api/sessions/${saved.id}`)
+          if (response.ok) {
+            const data = await response.json()
+            const restoredSession = {
+              id: saved.id,
+              wake_word: data.session.wake_word,
+              recording_count: data.session.recording_count,
+              status: data.session.status
+            }
+            setSession(restoredSession)
+            setWakeWord(data.session.wake_word)
+
+            // If training was in progress, restore that too
+            if (data.session.training_job_id) {
+              const trainingResponse = await fetch(`${API_BASE}/api/training/${data.session.training_job_id}`)
+              if (trainingResponse.ok) {
+                const trainingData = await trainingResponse.json()
+                setTrainingJob(trainingData.job)
+                setQueuePosition(trainingData.queue_position)
+
+                // Resume polling if still in progress
+                if (trainingData.job.status !== 'completed' && trainingData.job.status !== 'failed') {
+                  startPollingTrainingStatus(trainingData.job.id)
+                }
+              }
+            }
+          } else {
+            // Session expired or invalid, clear it
+            saveSession(null)
+          }
+        } catch (err) {
+          console.error('Failed to restore session:', err)
+          // Keep the saved session info but show as potentially stale
+        }
+      }
+    }
+
+    restoreSession()
+  }, [])
+
+  // Sync session to localStorage whenever it changes
+  useEffect(() => {
+    if (session) {
+      saveSession(session)
+    }
+  }, [session])
+
   // Request notification permission
   const requestNotificationPermission = async () => {
     if ('Notification' in window) {
@@ -262,7 +339,9 @@ function App() {
       if (!response.ok) throw new Error('Failed to create session')
 
       const data = await response.json()
-      setSession({ id: data.session_id, wake_word: word, recording_count: 0, status: 'recording' })
+      const newSession = { id: data.session_id, wake_word: word, recording_count: 0, status: 'recording' }
+      setSession(newSession)
+      saveSession(newSession)
       setSamples([])
       setTrainingJob(null)
       return data.session_id
@@ -633,6 +712,7 @@ function App() {
     samples.forEach(s => URL.revokeObjectURL(s.url))
     setSamples([])
     setSession(null)
+    saveSession(null)  // Clear from localStorage
     setTrainingJob(null)
     setWakeWord('')
     setQueuePosition(null)
