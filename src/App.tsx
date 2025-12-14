@@ -461,10 +461,10 @@ function App() {
         <div className="max-w-4xl mx-auto px-4 py-6">
           <h1 className="text-3xl font-bold text-white">Wake Word Trainer</h1>
           <p className="text-purple-300 mt-1">
-            Record, train, and download custom OpenWakeWord models
+            Create custom voice activation phrases for your projects - completely free
           </p>
           {session && (
-            <div className="mt-2 flex items-center gap-4">
+            <div className="mt-2 flex items-center gap-4 flex-wrap">
               <span className="text-green-400 text-sm">
                 ✓ Session active for "{session.wake_word}"
               </span>
@@ -479,45 +479,148 @@ function App() {
         </div>
       </header>
 
-      {/* Quick Start Guide */}
+      {/* Comprehensive Instructions */}
       {showQuickStart && activeTab === 'record' && (
-        <div className="max-w-4xl mx-auto px-4 pt-6">
-          <div className="bg-gradient-to-r from-blue-900/50 to-purple-900/50 rounded-2xl p-6 border border-blue-500/30">
+        <div className="max-w-4xl mx-auto px-4 pt-6 space-y-4">
+          {/* What is this tool */}
+          <div className="bg-gradient-to-r from-purple-900/50 to-indigo-900/50 rounded-2xl p-6 border border-purple-500/30">
             <div className="flex justify-between items-start mb-4">
               <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                <span className="text-2xl">📖</span> Quick Start Guide
+                <span className="text-2xl">🎯</span> What is This Tool?
               </h2>
               <button onClick={() => setShowQuickStart(false)} className="text-purple-400 hover:text-white text-sm">
-                Hide ✕
+                Hide Instructions ✕
               </button>
             </div>
+            <p className="text-purple-200 mb-4">
+              This tool lets you create <strong className="text-white">custom wake words</strong> (like "Hey Siri" or "Alexa") for your own projects.
+              Record your voice saying your chosen phrase, and we'll train an AI model that can detect when you say it.
+            </p>
+            <div className="grid md:grid-cols-3 gap-4 text-sm">
+              <div className="bg-white/5 rounded-lg p-3">
+                <div className="text-2xl mb-2">🏠</div>
+                <div className="text-white font-medium">Home Assistant</div>
+                <div className="text-purple-300">Custom wake words for your smart home</div>
+              </div>
+              <div className="bg-white/5 rounded-lg p-3">
+                <div className="text-2xl mb-2">🤖</div>
+                <div className="text-white font-medium">Voice Assistants</div>
+                <div className="text-purple-300">Build your own voice-activated apps</div>
+              </div>
+              <div className="bg-white/5 rounded-lg p-3">
+                <div className="text-2xl mb-2">🔒</div>
+                <div className="text-white font-medium">Privacy-First</div>
+                <div className="text-purple-300">Runs locally, no cloud required</div>
+              </div>
+            </div>
+          </div>
 
+          {/* Step by Step Process */}
+          <div className="bg-gradient-to-r from-blue-900/50 to-cyan-900/50 rounded-2xl p-6 border border-blue-500/30">
+            <h2 className="text-xl font-bold text-white flex items-center gap-2 mb-4">
+              <span className="text-2xl">📋</span> How It Works (4 Simple Steps)
+            </h2>
+            <div className="grid md:grid-cols-4 gap-4">
+              <div className="text-center">
+                <div className="w-12 h-12 bg-blue-500 rounded-full flex items-center justify-center text-white text-xl font-bold mx-auto mb-2">1</div>
+                <div className="text-white font-medium">Choose Your Phrase</div>
+                <div className="text-blue-200 text-sm mt-1">Pick something 2-4 syllables like "Hey Nexus" or "Computer"</div>
+              </div>
+              <div className="text-center">
+                <div className="w-12 h-12 bg-green-500 rounded-full flex items-center justify-center text-white text-xl font-bold mx-auto mb-2">2</div>
+                <div className="text-white font-medium">Record 20+ Samples</div>
+                <div className="text-green-200 text-sm mt-1">Click the mic button and say your phrase (one time per recording)</div>
+              </div>
+              <div className="text-center">
+                <div className="w-12 h-12 bg-purple-500 rounded-full flex items-center justify-center text-white text-xl font-bold mx-auto mb-2">3</div>
+                <div className="text-white font-medium">Train the Model</div>
+                <div className="text-purple-200 text-sm mt-1">Click "Train Model" and wait a few minutes</div>
+              </div>
+              <div className="text-center">
+                <div className="w-12 h-12 bg-yellow-500 rounded-full flex items-center justify-center text-white text-xl font-bold mx-auto mb-2">4</div>
+                <div className="text-white font-medium">Download & Use</div>
+                <div className="text-yellow-200 text-sm mt-1">Get your .onnx file and use it in your projects</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Recording Instructions */}
+          <div className="bg-gradient-to-r from-green-900/50 to-emerald-900/50 rounded-2xl p-6 border border-green-500/30">
+            <h2 className="text-xl font-bold text-white flex items-center gap-2 mb-4">
+              <span className="text-2xl">🎙️</span> Recording Instructions
+            </h2>
             <div className="grid md:grid-cols-2 gap-6">
               <div>
-                <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
-                  <span className="w-6 h-6 bg-green-500 rounded-full flex items-center justify-center text-sm">✓</span>
-                  How Each Recording Works
-                </h3>
-                <ol className="space-y-2 text-purple-200 text-sm">
-                  <li className="flex gap-2"><span className="text-blue-400 font-mono">0.0-0.5s</span><span>👂 Silence - get ready</span></li>
-                  <li className="flex gap-2"><span className="text-green-400 font-mono">0.5-2.0s</span><span>🗣️ <strong>Say your wake word ONCE</strong></span></li>
-                  <li className="flex gap-2"><span className="text-blue-400 font-mono">2.0-3.0s</span><span>👂 Silence - let it finish</span></li>
-                </ol>
-                <div className="mt-4 p-3 bg-yellow-500/20 border border-yellow-500/30 rounded-lg">
-                  <p className="text-yellow-200 text-sm"><strong>Important:</strong> Say the wake word <strong>exactly ONE time</strong> per recording.</p>
+                <h3 className="text-white font-semibold mb-3">Each 3-Second Recording:</h3>
+                <div className="bg-black/30 rounded-lg p-4 mb-4">
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="w-20 h-6 bg-blue-500/50 rounded" />
+                    <span className="text-blue-300 text-sm">0.0s - 0.5s: Stay silent</span>
+                  </div>
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="w-48 h-6 bg-green-500/50 rounded" />
+                    <span className="text-green-300 text-sm">0.5s - 2.0s: <strong>SAY YOUR PHRASE</strong></span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="w-32 h-6 bg-blue-500/50 rounded" />
+                    <span className="text-blue-300 text-sm">2.0s - 3.0s: Stay silent</span>
+                  </div>
+                </div>
+                <div className="p-3 bg-red-500/20 border border-red-500/30 rounded-lg">
+                  <p className="text-red-200 text-sm">
+                    <strong>⚠️ Critical:</strong> Say your wake word <strong>exactly ONE time</strong> per recording.
+                    Not twice, not three times - just once! The silence before and after is important for training.
+                  </p>
                 </div>
               </div>
               <div>
-                <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
-                  <span className="w-6 h-6 bg-purple-500 rounded-full flex items-center justify-center text-sm">🎯</span>
-                  Tips for Better Training
-                </h3>
-                <ul className="space-y-2 text-purple-200 text-sm">
-                  <li className="flex gap-2"><span>🔊</span><span>Vary your <strong>volume</strong> - quiet, normal, loud</span></li>
-                  <li className="flex gap-2"><span>📏</span><span>Vary your <strong>distance</strong> - close and far from mic</span></li>
-                  <li className="flex gap-2"><span>⏱️</span><span>Vary your <strong>speed</strong> - slow, normal, fast</span></li>
-                  <li className="flex gap-2"><span>🎭</span><span>Vary your <strong>tone</strong> - tired, excited, questioning</span></li>
+                <h3 className="text-white font-semibold mb-3">Tips for Best Results:</h3>
+                <ul className="space-y-2 text-green-200 text-sm">
+                  <li className="flex gap-2 items-start">
+                    <span className="text-xl">🔊</span>
+                    <span><strong>Vary your volume</strong> - Some loud, some soft, some normal. This helps the model work in different situations.</span>
+                  </li>
+                  <li className="flex gap-2 items-start">
+                    <span className="text-xl">📏</span>
+                    <span><strong>Vary your distance</strong> - Some recordings close to the mic, some further away.</span>
+                  </li>
+                  <li className="flex gap-2 items-start">
+                    <span className="text-xl">⏱️</span>
+                    <span><strong>Vary your speed</strong> - Some slow and deliberate, some faster and casual.</span>
+                  </li>
+                  <li className="flex gap-2 items-start">
+                    <span className="text-xl">🎭</span>
+                    <span><strong>Vary your emotion</strong> - Tired, excited, bored, questioning - however you might actually say it.</span>
+                  </li>
+                  <li className="flex gap-2 items-start">
+                    <span className="text-xl">👥</span>
+                    <span><strong>Multiple speakers</strong> - If others will use it, have them record samples too!</span>
+                  </li>
                 </ul>
+              </div>
+            </div>
+          </div>
+
+          {/* Sample Counts */}
+          <div className="bg-gradient-to-r from-yellow-900/50 to-orange-900/50 rounded-2xl p-6 border border-yellow-500/30">
+            <h2 className="text-xl font-bold text-white flex items-center gap-2 mb-4">
+              <span className="text-2xl">📊</span> How Many Recordings Do I Need?
+            </h2>
+            <div className="grid md:grid-cols-3 gap-4">
+              <div className="bg-white/5 rounded-lg p-4 border-2 border-yellow-500/30">
+                <div className="text-3xl font-bold text-yellow-400 mb-1">20</div>
+                <div className="text-white font-medium">Minimum</div>
+                <div className="text-yellow-200 text-sm">Required to train. Model will work but may have some false positives.</div>
+              </div>
+              <div className="bg-white/5 rounded-lg p-4 border-2 border-green-500/50">
+                <div className="text-3xl font-bold text-green-400 mb-1">50</div>
+                <div className="text-white font-medium">Recommended</div>
+                <div className="text-green-200 text-sm">Good balance of quality and effort. Works well for most use cases.</div>
+              </div>
+              <div className="bg-white/5 rounded-lg p-4 border-2 border-purple-500/50">
+                <div className="text-3xl font-bold text-purple-400 mb-1">100+</div>
+                <div className="text-white font-medium">Ideal</div>
+                <div className="text-purple-200 text-sm">Best accuracy and lowest false positive rate. Great for production use.</div>
               </div>
             </div>
           </div>
