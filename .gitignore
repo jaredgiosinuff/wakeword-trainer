@@ -17,3 +17,4 @@ dist/
 # Local env files
 .env
 .env.local
+backend/venv/
