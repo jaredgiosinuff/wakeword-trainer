@@ -24,6 +24,7 @@ interface CommunityWakeword {
 
 type Tab = 'record' | 'browse'
 type SortBy = 'weightedRating' | 'sampleCount' | 'name' | 'createdAt'
+type RecordingPhase = 'ready' | 'countdown' | 'listen' | 'speak' | 'done'
 
 // API base URL - configure for your deployment
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -38,15 +39,71 @@ function getVisitorId(): string {
   return id
 }
 
+// Tooltip component
+function Tooltip({ children, text }: { children: React.ReactNode; text: string }) {
+  const [show, setShow] = useState(false)
+  return (
+    <span className="relative inline-block">
+      <span
+        onMouseEnter={() => setShow(true)}
+        onMouseLeave={() => setShow(false)}
+        className="cursor-help"
+      >
+        {children}
+      </span>
+      {show && (
+        <span className="absolute z-50 w-64 p-2 text-xs text-white bg-gray-900 rounded-lg shadow-lg -top-2 left-full ml-2">
+          {text}
+          <span className="absolute top-3 -left-1 w-2 h-2 bg-gray-900 transform rotate-45" />
+        </span>
+      )}
+    </span>
+  )
+}
+
+// Info icon for tooltips
+function InfoIcon() {
+  return (
+    <svg className="w-4 h-4 inline-block ml-1 text-purple-400" fill="currentColor" viewBox="0 0 20 20">
+      <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+    </svg>
+  )
+}
+
+// Progress bar component
+function ProgressBar({ current, target, label }: { current: number; target: number; label: string }) {
+  const percentage = Math.min((current / target) * 100, 100)
+  const isComplete = current >= target
+
+  return (
+    <div className="mb-2">
+      <div className="flex justify-between text-sm mb-1">
+        <span className="text-purple-300">{label}</span>
+        <span className={isComplete ? 'text-green-400' : 'text-purple-300'}>
+          {current}/{target} {isComplete && '✓'}
+        </span>
+      </div>
+      <div className="h-2 bg-white/10 rounded-full overflow-hidden">
+        <div
+          className={`h-full transition-all duration-300 ${isComplete ? 'bg-green-500' : 'bg-purple-500'}`}
+          style={{ width: `${percentage}%` }}
+        />
+      </div>
+    </div>
+  )
+}
+
 function App() {
   // Tab state
   const [activeTab, setActiveTab] = useState<Tab>('record')
+  const [showQuickStart, setShowQuickStart] = useState(true)
 
   // Recording state
   const [wakeWord, setWakeWord] = useState('')
   const [samples, setSamples] = useState<AudioSample[]>([])
   const [isRecording, setIsRecording] = useState(false)
   const [recordingTime, setRecordingTime] = useState(0)
+  const [recordingPhase, setRecordingPhase] = useState<RecordingPhase>('ready')
   const [error, setError] = useState<string | null>(null)
   const [playingId, setPlayingId] = useState<string | null>(null)
   const [agreedToShare, setAgreedToShare] = useState(false)
@@ -65,8 +122,11 @@ function App() {
   const chunksRef = useRef<Blob[]>([])
   const timerRef = useRef<number | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
 
   const TARGET_DURATION = 3.0
+  const SPEAK_START = 0.5  // Start speaking at 0.5s
+  const SPEAK_END = 2.0    // Stop speaking by 2.0s
 
   // Fetch community wakewords
   const fetchWakewords = useCallback(async () => {
@@ -117,6 +177,7 @@ function App() {
     try {
       setError(null)
       chunksRef.current = []
+      setRecordingPhase('countdown')
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -126,6 +187,7 @@ function App() {
           noiseSuppression: true,
         }
       })
+      streamRef.current = stream
 
       audioContextRef.current = new AudioContext({ sampleRate: 16000 })
 
@@ -159,7 +221,11 @@ function App() {
         }
 
         setSamples(prev => [...prev, sample])
-        stream.getTracks().forEach(track => track.stop())
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(track => track.stop())
+        }
+        setRecordingPhase('done')
+        setTimeout(() => setRecordingPhase('ready'), 1000)
       }
 
       mediaRecorder.start(100)
@@ -170,13 +236,24 @@ function App() {
       timerRef.current = window.setInterval(() => {
         const elapsed = (Date.now() - startTime) / 1000
         setRecordingTime(elapsed)
+
+        // Update recording phase
+        if (elapsed < SPEAK_START) {
+          setRecordingPhase('listen')
+        } else if (elapsed < SPEAK_END) {
+          setRecordingPhase('speak')
+        } else {
+          setRecordingPhase('listen')
+        }
+
         if (elapsed >= TARGET_DURATION) {
           stopRecording()
         }
-      }, 100)
+      }, 50)
 
     } catch (err) {
-      setError('Microphone access denied. Please allow microphone access.')
+      setError('Microphone access denied. Please allow microphone access and try again.')
+      setRecordingPhase('ready')
       console.error(err)
     }
   }, [])
@@ -225,7 +302,6 @@ function App() {
     setUploadProgress('Creating wakeword entry...')
 
     try {
-      // Create or get wakeword
       const createRes = await fetch(`${API_BASE}/wakewords`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -233,12 +309,10 @@ function App() {
       })
       const { wakeword } = await createRes.json()
 
-      // Upload each sample
       for (let i = 0; i < samples.length; i++) {
         setUploadProgress(`Uploading sample ${i + 1}/${samples.length}...`)
 
         const sample = samples[i]
-        // Get presigned URL
         const urlRes = await fetch(`${API_BASE}/wakewords/${wakeword.id}/samples`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -251,7 +325,6 @@ function App() {
         })
         const { uploadUrl } = await urlRes.json()
 
-        // Upload to S3
         await fetch(uploadUrl, {
           method: 'PUT',
           headers: { 'Content-Type': 'audio/webm' },
@@ -263,7 +336,6 @@ function App() {
       setTimeout(() => {
         setUploadProgress('')
         setIsUploading(false)
-        // Clear samples after successful upload
         samples.forEach(s => URL.revokeObjectURL(s.url))
         setSamples([])
         setWakeWord('')
@@ -297,10 +369,12 @@ function App() {
       exportDate: new Date().toISOString(),
       format: 'webm (convert to 16kHz mono WAV for training)',
       targetDuration: TARGET_DURATION,
+      instructions: 'Each sample contains ONE utterance of the wake word. Convert to WAV using the included script before training.',
     }
     folder.file('metadata.json', JSON.stringify(metadata, null, 2))
 
     const convertScript = `#!/bin/bash
+# Convert WebM samples to 16kHz mono WAV for OpenWakeWord training
 mkdir -p wav_output
 for f in *.webm; do
   if [ -f "$f" ]; then
@@ -309,6 +383,7 @@ for f in *.webm; do
   fi
 done
 echo "Done! WAV files are in wav_output/"
+echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
 `
     folder.file('convert_to_wav.sh', convertScript)
 
@@ -327,6 +402,49 @@ echo "Done! WAV files are in wav_output/"
       if (timerRef.current) clearInterval(timerRef.current)
     }
   }, [])
+
+  // Get phase-specific UI
+  const getRecordingUI = () => {
+    switch (recordingPhase) {
+      case 'countdown':
+        return {
+          color: 'bg-yellow-500',
+          icon: '⏳',
+          text: 'Get ready...',
+          subtext: 'Microphone activating'
+        }
+      case 'listen':
+        return {
+          color: 'bg-blue-500',
+          icon: '👂',
+          text: 'Silence',
+          subtext: recordingTime < SPEAK_START ? 'Wait for the cue...' : 'Hold silence...'
+        }
+      case 'speak':
+        return {
+          color: 'bg-green-500 animate-pulse',
+          icon: '🗣️',
+          text: `Say "${wakeWord}" NOW!`,
+          subtext: 'Speak clearly, one time only'
+        }
+      case 'done':
+        return {
+          color: 'bg-purple-500',
+          icon: '✅',
+          text: 'Sample saved!',
+          subtext: 'Ready for another'
+        }
+      default:
+        return {
+          color: wakeWord.trim() ? 'bg-purple-600 hover:bg-purple-500' : 'bg-gray-600',
+          icon: '🎙️',
+          text: wakeWord.trim() ? 'Click to Record' : 'Enter wake word first',
+          subtext: wakeWord.trim() ? 'One sample at a time' : ''
+        }
+    }
+  }
+
+  const ui = getRecordingUI()
 
   // Star rating component
   const StarRating = ({ wakewordId, currentRating, userRating, ratingCount }: {
@@ -364,12 +482,96 @@ echo "Done! WAV files are in wav_output/"
       {/* Header */}
       <header className="bg-black/30 border-b border-white/10">
         <div className="max-w-4xl mx-auto px-4 py-6">
-          <h1 className="text-3xl font-bold text-white">🎤 Wake Word Trainer</h1>
+          <h1 className="text-3xl font-bold text-white">Wake Word Trainer</h1>
           <p className="text-purple-300 mt-1">
-            Record & share samples for OpenWakeWord training
+            Record samples for training custom OpenWakeWord models
           </p>
         </div>
       </header>
+
+      {/* Quick Start Guide */}
+      {showQuickStart && activeTab === 'record' && (
+        <div className="max-w-4xl mx-auto px-4 pt-6">
+          <div className="bg-gradient-to-r from-blue-900/50 to-purple-900/50 rounded-2xl p-6 border border-blue-500/30">
+            <div className="flex justify-between items-start mb-4">
+              <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                <span className="text-2xl">📖</span> Quick Start Guide
+              </h2>
+              <button
+                onClick={() => setShowQuickStart(false)}
+                className="text-purple-400 hover:text-white text-sm"
+              >
+                Hide ✕
+              </button>
+            </div>
+
+            <div className="grid md:grid-cols-2 gap-6">
+              <div>
+                <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
+                  <span className="w-6 h-6 bg-green-500 rounded-full flex items-center justify-center text-sm">✓</span>
+                  How Each Recording Works
+                </h3>
+                <ol className="space-y-2 text-purple-200 text-sm">
+                  <li className="flex gap-2">
+                    <span className="text-blue-400 font-mono">0.0-0.5s</span>
+                    <span>👂 Silence - get ready</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="text-green-400 font-mono">0.5-2.0s</span>
+                    <span>🗣️ <strong>Say your wake word ONCE</strong></span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="text-blue-400 font-mono">2.0-3.0s</span>
+                    <span>👂 Silence - let it finish</span>
+                  </li>
+                </ol>
+
+                <div className="mt-4 p-3 bg-yellow-500/20 border border-yellow-500/30 rounded-lg">
+                  <p className="text-yellow-200 text-sm">
+                    <strong>Important:</strong> Say the wake word <strong>exactly ONE time</strong> per recording.
+                    The model learns from the silence before and after.
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
+                  <span className="w-6 h-6 bg-purple-500 rounded-full flex items-center justify-center text-sm">🎯</span>
+                  Tips for Better Training
+                </h3>
+                <ul className="space-y-2 text-purple-200 text-sm">
+                  <li className="flex gap-2">
+                    <span>🔊</span>
+                    <span>Vary your <strong>volume</strong> - quiet, normal, loud</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span>📏</span>
+                    <span>Vary your <strong>distance</strong> - close and far from mic</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span>⏱️</span>
+                    <span>Vary your <strong>speed</strong> - slow, normal, fast</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span>🎭</span>
+                    <span>Vary your <strong>tone</strong> - tired, excited, questioning</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span>👥</span>
+                    <span>Get <strong>multiple people</strong> if possible</span>
+                  </li>
+                </ul>
+
+                <div className="mt-4 p-3 bg-purple-500/20 border border-purple-500/30 rounded-lg">
+                  <p className="text-purple-200 text-sm">
+                    <strong>Goal:</strong> 50-100+ diverse samples create robust models that work in real conditions.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="max-w-4xl mx-auto px-4 pt-6">
@@ -394,6 +596,14 @@ echo "Done! WAV files are in wav_output/"
           >
             🔍 Browse Community
           </button>
+          {!showQuickStart && activeTab === 'record' && (
+            <button
+              onClick={() => setShowQuickStart(true)}
+              className="ml-auto px-4 py-2 text-purple-400 hover:text-white text-sm"
+            >
+              📖 Show Guide
+            </button>
+          )}
         </div>
       </div>
 
@@ -401,59 +611,90 @@ echo "Done! WAV files are in wav_output/"
         {activeTab === 'record' ? (
           <>
             {/* Wake Word Input */}
-            <section className="bg-white/10 backdrop-blur rounded-2xl rounded-tl-none p-6 mb-8">
+            <section className="bg-white/10 backdrop-blur rounded-2xl rounded-tl-none p-6 mb-6">
               <label className="block text-white font-medium mb-2">
                 Wake Word / Phrase
+                <Tooltip text="Choose a word or short phrase that will activate your voice assistant. 2-4 syllables work best. Examples: 'Hey Jarvis', 'Computer', 'OK Nexus'">
+                  <InfoIcon />
+                </Tooltip>
               </label>
               <input
                 type="text"
                 value={wakeWord}
                 onChange={(e) => setWakeWord(e.target.value)}
-                placeholder='e.g., "Hey Jarvis" or "Computer"'
-                className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                placeholder='e.g., "Hey Nexus" or "Computer"'
+                className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500 text-lg"
               />
-              <p className="text-sm text-purple-300 mt-2">
-                Tip: 3-4 syllables with diverse phonemes works best.
-              </p>
+              <div className="flex gap-4 mt-2 text-sm text-purple-300">
+                <span>💡 Good: 2-4 syllables</span>
+                <span>💡 Unique sounds</span>
+                <span>💡 Easy to say</span>
+              </div>
             </section>
 
             {/* Recording Section */}
-            <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-8">
+            <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-6">
               <div className="flex flex-col items-center">
+                {/* Main record button */}
                 <button
                   onClick={isRecording ? stopRecording : startRecording}
-                  disabled={!wakeWord.trim()}
-                  className={`relative w-32 h-32 rounded-full flex items-center justify-center text-white text-5xl transition-all ${
-                    isRecording
-                      ? 'bg-red-600 recording-pulse'
-                      : wakeWord.trim()
-                        ? 'bg-purple-600 hover:bg-purple-500 hover:scale-105'
-                        : 'bg-gray-600 cursor-not-allowed opacity-50'
+                  disabled={!wakeWord.trim() || recordingPhase === 'countdown'}
+                  className={`relative w-36 h-36 rounded-full flex flex-col items-center justify-center text-white transition-all shadow-lg ${
+                    isRecording ? ui.color : (wakeWord.trim() ? 'bg-purple-600 hover:bg-purple-500 hover:scale-105' : 'bg-gray-600 cursor-not-allowed opacity-50')
                   }`}
                 >
-                  {isRecording ? '⏹' : '🎙️'}
+                  <span className="text-5xl">{isRecording ? ui.icon : '🎙️'}</span>
                 </button>
 
-                <div className="mt-4 text-center">
+                {/* Status text */}
+                <div className="mt-4 text-center min-h-[80px]">
                   {isRecording ? (
-                    <div className="text-white">
-                      <span className="text-3xl font-mono">{recordingTime.toFixed(1)}s</span>
-                      <span className="text-purple-300 ml-2">/ {TARGET_DURATION}s</span>
-                      <p className="text-purple-300 mt-2">Say "{wakeWord}" now!</p>
-                    </div>
+                    <>
+                      <p className={`text-xl font-bold ${recordingPhase === 'speak' ? 'text-green-400' : 'text-white'}`}>
+                        {ui.text}
+                      </p>
+                      <p className="text-purple-300 mt-1">{ui.subtext}</p>
+                      <div className="flex items-center justify-center gap-2 mt-2">
+                        <span className="text-2xl font-mono text-white">{recordingTime.toFixed(1)}s</span>
+                        <span className="text-purple-400">/ {TARGET_DURATION}s</span>
+                      </div>
+                    </>
                   ) : (
-                    <p className="text-purple-300">
-                      {wakeWord.trim() ? 'Click to start recording' : 'Enter your wake word above'}
-                    </p>
+                    <>
+                      <p className="text-white text-lg">{ui.text}</p>
+                      {ui.subtext && <p className="text-purple-300 text-sm mt-1">{ui.subtext}</p>}
+                    </>
                   )}
                 </div>
 
+                {/* Timeline visualization */}
                 {isRecording && (
-                  <div className="w-full max-w-xs mt-4 h-2 bg-white/20 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-purple-500 transition-all duration-100"
-                      style={{ width: `${(recordingTime / TARGET_DURATION) * 100}%` }}
-                    />
+                  <div className="w-full max-w-md mt-4">
+                    <div className="relative h-8 bg-white/10 rounded-full overflow-hidden">
+                      {/* Sections */}
+                      <div className="absolute inset-0 flex">
+                        <div className="w-[16.7%] bg-blue-500/30 border-r border-white/20" title="Silence" />
+                        <div className="w-[50%] bg-green-500/30 border-r border-white/20" title="Speak" />
+                        <div className="w-[33.3%] bg-blue-500/30" title="Silence" />
+                      </div>
+                      {/* Progress indicator */}
+                      <div
+                        className="absolute top-0 bottom-0 w-1 bg-white shadow-lg transition-all duration-50"
+                        style={{ left: `${(recordingTime / TARGET_DURATION) * 100}%` }}
+                      />
+                      {/* Labels */}
+                      <div className="absolute inset-0 flex items-center text-xs text-white/70 pointer-events-none">
+                        <span className="w-[16.7%] text-center">👂</span>
+                        <span className="w-[50%] text-center font-bold text-white">🗣️ SPEAK</span>
+                        <span className="w-[33.3%] text-center">👂</span>
+                      </div>
+                    </div>
+                    <div className="flex justify-between text-xs text-purple-400 mt-1">
+                      <span>0s</span>
+                      <span>0.5s</span>
+                      <span>2.0s</span>
+                      <span>3.0s</span>
+                    </div>
                   </div>
                 )}
               </div>
@@ -465,33 +706,77 @@ echo "Done! WAV files are in wav_output/"
               )}
             </section>
 
+            {/* Progress Tracking */}
+            <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-6">
+              <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                📊 Training Progress
+                <Tooltip text="More samples = better model. Aim for at least 50 samples with good variety. 100+ samples create highly accurate models.">
+                  <InfoIcon />
+                </Tooltip>
+              </h2>
+
+              <ProgressBar current={samples.length} target={20} label="Minimum (basic training)" />
+              <ProgressBar current={samples.length} target={50} label="Recommended (good accuracy)" />
+              <ProgressBar current={samples.length} target={100} label="Ideal (excellent accuracy)" />
+
+              {samples.length > 0 && samples.length < 20 && (
+                <p className="text-yellow-300 text-sm mt-3">
+                  ⚠️ Keep recording! You need at least 20 samples for basic training.
+                </p>
+              )}
+              {samples.length >= 20 && samples.length < 50 && (
+                <p className="text-blue-300 text-sm mt-3">
+                  👍 Good start! More samples will improve accuracy.
+                </p>
+              )}
+              {samples.length >= 50 && (
+                <p className="text-green-300 text-sm mt-3">
+                  ✨ Great! You have enough for a solid model. More variety always helps!
+                </p>
+              )}
+            </section>
+
             {/* Samples List */}
-            <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-8">
+            <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-xl font-semibold text-white">
                   Recorded Samples ({samples.length})
                 </h2>
                 <div className="flex gap-2">
                   {samples.length > 0 && (
-                    <button
-                      onClick={exportSamples}
-                      className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition"
-                    >
-                      💾 Export ZIP
-                    </button>
+                    <>
+                      <button
+                        onClick={() => {
+                          samples.forEach(s => URL.revokeObjectURL(s.url))
+                          setSamples([])
+                        }}
+                        className="bg-red-600/50 hover:bg-red-600 text-white px-3 py-2 rounded-lg text-sm transition"
+                      >
+                        🗑️ Clear All
+                      </button>
+                      <button
+                        onClick={exportSamples}
+                        className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition"
+                      >
+                        💾 Export ZIP
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
 
               {samples.length === 0 ? (
-                <p className="text-purple-300 text-center py-8">
-                  No samples yet. Record at least 10-20 for basic training.
-                </p>
+                <div className="text-center py-8">
+                  <p className="text-purple-300 text-lg">No samples yet</p>
+                  <p className="text-purple-400 text-sm mt-2">
+                    Enter your wake word above and click the record button to start
+                  </p>
+                </div>
               ) : (
-                <div className="space-y-2">
+                <div className="space-y-2 max-h-64 overflow-y-auto">
                   {samples.map((sample, index) => (
-                    <div key={sample.id} className="flex items-center gap-4 bg-white/5 rounded-lg p-3">
-                      <span className="text-purple-300 font-mono w-8">#{index + 1}</span>
+                    <div key={sample.id} className="flex items-center gap-4 bg-white/5 rounded-lg p-3 hover:bg-white/10 transition">
+                      <span className="text-purple-300 font-mono w-10 text-sm">#{index + 1}</span>
                       <button
                         onClick={() => playingId === sample.id ? stopPlayback() : playSample(sample)}
                         className="w-10 h-10 rounded-full bg-purple-600 hover:bg-purple-500 text-white flex items-center justify-center transition"
@@ -502,24 +787,22 @@ echo "Done! WAV files are in wav_output/"
                         <div className="text-white text-sm">{sample.duration.toFixed(1)}s</div>
                         <div className="text-purple-400 text-xs">{sample.timestamp.toLocaleTimeString()}</div>
                       </div>
-                      <button onClick={() => deleteSample(sample.id)} className="text-red-400 hover:text-red-300 p-2">
+                      <button
+                        onClick={() => deleteSample(sample.id)}
+                        className="text-red-400 hover:text-red-300 p-2 opacity-50 hover:opacity-100 transition"
+                        title="Delete sample"
+                      >
                         🗑️
                       </button>
                     </div>
                   ))}
                 </div>
               )}
-
-              {samples.length > 0 && samples.length < 10 && (
-                <div className="mt-4 p-4 bg-yellow-500/20 border border-yellow-500/50 rounded-lg text-yellow-200">
-                  ⚠️ Record at least 10-20 samples for better results.
-                </div>
-              )}
             </section>
 
             {/* Share Agreement & Upload */}
             {samples.length >= 5 && API_BASE && (
-              <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-8">
+              <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-6">
                 <h2 className="text-xl font-semibold text-white mb-4">📤 Share with Community</h2>
 
                 <div className="bg-purple-900/50 rounded-lg p-4 mb-4">
@@ -557,32 +840,43 @@ echo "Done! WAV files are in wav_output/"
               </section>
             )}
 
-            {/* Instructions */}
+            {/* Next Steps */}
             <section className="bg-white/10 backdrop-blur rounded-2xl p-6">
-              <h2 className="text-xl font-semibold text-white mb-4">📚 Training Instructions</h2>
+              <h2 className="text-xl font-semibold text-white mb-4">🚀 After Recording</h2>
               <div className="space-y-4 text-purple-200">
-                <div className="flex gap-3">
-                  <span className="text-2xl">1️⃣</span>
+                <div className="flex gap-4 p-4 bg-white/5 rounded-lg">
+                  <span className="text-3xl">1️⃣</span>
                   <div>
-                    <h3 className="text-white font-medium">Record Samples</h3>
-                    <p className="text-sm">50-100+ samples with varied tone, speed, and distance.</p>
+                    <h3 className="text-white font-medium">Export Your Samples</h3>
+                    <p className="text-sm">Click "Export ZIP" to download your recordings with metadata and conversion scripts.</p>
                   </div>
                 </div>
-                <div className="flex gap-3">
-                  <span className="text-2xl">2️⃣</span>
+                <div className="flex gap-4 p-4 bg-white/5 rounded-lg">
+                  <span className="text-3xl">2️⃣</span>
                   <div>
-                    <h3 className="text-white font-medium">Export & Convert</h3>
-                    <p className="text-sm">Use the included script to convert to 16kHz mono WAV.</p>
+                    <h3 className="text-white font-medium">Convert to WAV</h3>
+                    <p className="text-sm">Run <code className="bg-black/30 px-2 py-1 rounded">./convert_to_wav.sh</code> (requires FFmpeg) to get 16kHz mono WAV files.</p>
                   </div>
                 </div>
-                <div className="flex gap-3">
-                  <span className="text-2xl">3️⃣</span>
+                <div className="flex gap-4 p-4 bg-white/5 rounded-lg">
+                  <span className="text-3xl">3️⃣</span>
                   <div>
-                    <h3 className="text-white font-medium">Train with OpenWakeWord</h3>
+                    <h3 className="text-white font-medium">Train Your Model</h3>
                     <p className="text-sm">
+                      Use the{' '}
                       <a href="https://github.com/dscripka/openWakeWord" target="_blank" rel="noopener noreferrer" className="text-purple-400 hover:text-purple-300 underline">
                         OpenWakeWord training notebook
-                      </a>
+                      </a>{' '}
+                      to create your custom ONNX model.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex gap-4 p-4 bg-white/5 rounded-lg">
+                  <span className="text-3xl">4️⃣</span>
+                  <div>
+                    <h3 className="text-white font-medium">Use in Your Project</h3>
+                    <p className="text-sm">
+                      Works with Home Assistant, Knowledge Nexus, or any OpenWakeWord-compatible application.
                     </p>
                   </div>
                 </div>
