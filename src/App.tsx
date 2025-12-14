@@ -634,14 +634,19 @@ function App() {
       const startTime = Date.now()
 
       // AUTO-STOP: Use setTimeout to guarantee stop after exactly 3 seconds
+      console.log('Starting recording, will auto-stop in', TARGET_DURATION, 'seconds')
       const autoStopTimeout = setTimeout(() => {
+        console.log('Auto-stop timeout fired! mediaRecorder.state =', mediaRecorder.state)
         if (mediaRecorder.state === 'recording') {
+          console.log('Stopping recording now!')
           mediaRecorder.stop()
           setIsRecording(false)
           if (timerRef.current) {
             clearInterval(timerRef.current)
             timerRef.current = null
           }
+        } else {
+          console.log('NOT stopping - state is not recording')
         }
       }, TARGET_DURATION * 1000)
 
