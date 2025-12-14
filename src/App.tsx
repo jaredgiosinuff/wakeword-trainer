@@ -28,8 +28,12 @@ interface TrainingJob {
 type Tab = 'record' | 'train'
 type RecordingPhase = 'ready' | 'countdown' | 'listen' | 'speak' | 'done'
 
-// API base URL - configure for your deployment
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8400'
+// API base URL - use relative path in production, localhost in development
+const API_BASE = import.meta.env.VITE_API_URL || (
+  window.location.hostname === 'localhost'
+    ? 'http://localhost:8400'
+    : '/wakeword-trainer'
+)
 
 // Tooltip component
 function Tooltip({ children, text }: { children: React.ReactNode; text: string }) {
