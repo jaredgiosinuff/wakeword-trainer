@@ -9,9 +9,11 @@ DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
 RECORDINGS_DIR = DATA_DIR / "recordings"
 MODELS_DIR = DATA_DIR / "models"
 TEMP_DIR = DATA_DIR / "temp"
+COMMUNITY_DIR = DATA_DIR / "community"
+COMMUNITY_DB_PATH = COMMUNITY_DIR / "community.json"
 
 # Ensure directories exist
-for dir_path in [RECORDINGS_DIR, MODELS_DIR, TEMP_DIR]:
+for dir_path in [RECORDINGS_DIR, MODELS_DIR, TEMP_DIR, COMMUNITY_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
 # Recording settings
@@ -31,3 +33,7 @@ OPTIMAL_RECORDINGS = 100
 # Synthetic data settings
 SYNTHETIC_SAMPLES_PER_VOICE = 50
 NUM_SYNTHETIC_VOICES = 10
+
+# Community settings
+COMMUNITY_VOTE_THRESHOLD = 10  # Min votes before removal eligible
+COMMUNITY_REMOVAL_RATIO = 0.5  # Remove if thumbs_down > thumbs_up (more than 50% negative)

@@ -91,3 +91,39 @@ class StartTrainingRequest(BaseModel):
 class TrainingStatusResponse(BaseModel):
     job: TrainingJob
     download_ready: bool
+    queue_position: Optional[int] = None  # 0 = currently running, 1+ = position in queue
+
+
+# Community models
+class CommunityWakeWord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    wake_word: str
+    description: Optional[str] = None
+    contributor: Optional[str] = None  # Optional username/alias
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    model_filename: str
+    download_count: int = 0
+    thumbs_up: int = 0
+    thumbs_down: int = 0
+
+    # Training metadata (helps users evaluate quality)
+    recording_count: int = 0
+    used_synthetic: bool = True
+    synthetic_voices: int = 0
+    augmentation_factor: int = 0
+
+
+class ShareToCommunnityRequest(BaseModel):
+    job_id: str
+    description: Optional[str] = None
+    contributor: Optional[str] = None
+
+
+class VoteRequest(BaseModel):
+    vote: str = Field(..., pattern="^(up|down)$")  # "up" or "down"
+    voter_id: str  # Browser fingerprint or session ID to prevent double voting
+
+
+class CommunityListResponse(BaseModel):
+    wake_words: list[CommunityWakeWord]
+    total: int

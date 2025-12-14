@@ -25,7 +25,20 @@ interface TrainingJob {
   model_path?: string
 }
 
-type Tab = 'record' | 'train'
+interface CommunityModel {
+  id: string
+  wake_word: string
+  description?: string
+  contributor?: string
+  created_at: string
+  download_count: number
+  thumbs_up: number
+  thumbs_down: number
+  recording_count: number
+  used_synthetic: boolean
+}
+
+type Tab = 'record' | 'train' | 'community'
 type RecordingPhase = 'ready' | 'countdown' | 'listen' | 'speak' | 'done'
 
 // API base URL - use relative path in production, localhost in development
@@ -34,6 +47,16 @@ const API_BASE = import.meta.env.VITE_API_URL || (
     ? 'http://localhost:8400'
     : '/wakeword-trainer'
 )
+
+// Generate a unique voter ID for this browser
+const getVoterId = () => {
+  let voterId = localStorage.getItem('wakeword_voter_id')
+  if (!voterId) {
+    voterId = crypto.randomUUID()
+    localStorage.setItem('wakeword_voter_id', voterId)
+  }
+  return voterId
+}
 
 // Tooltip component
 function Tooltip({ children, text }: { children: React.ReactNode; text: string }) {
@@ -89,6 +112,42 @@ function ProgressBar({ current, target, label }: { current: number; target: numb
   )
 }
 
+// Quality score component
+function QualityScore({ model }: { model: CommunityModel }) {
+  const total = model.thumbs_up + model.thumbs_down
+  const percentage = total > 0 ? (model.thumbs_up / total * 100).toFixed(0) : '-'
+
+  let quality = 'Unknown'
+  let color = 'text-gray-400'
+  let bg = 'bg-gray-500/20'
+
+  if (total >= 5) {
+    if (percentage !== '-' && parseInt(percentage) >= 80) {
+      quality = 'Excellent'
+      color = 'text-green-400'
+      bg = 'bg-green-500/20'
+    } else if (percentage !== '-' && parseInt(percentage) >= 60) {
+      quality = 'Good'
+      color = 'text-blue-400'
+      bg = 'bg-blue-500/20'
+    } else if (percentage !== '-' && parseInt(percentage) >= 40) {
+      quality = 'Fair'
+      color = 'text-yellow-400'
+      bg = 'bg-yellow-500/20'
+    } else {
+      quality = 'Poor'
+      color = 'text-red-400'
+      bg = 'bg-red-500/20'
+    }
+  }
+
+  return (
+    <div className={`px-2 py-1 rounded text-xs ${bg} ${color}`}>
+      {quality} ({percentage}% positive)
+    </div>
+  )
+}
+
 function App() {
   // Tab state
   const [activeTab, setActiveTab] = useState<Tab>('record')
@@ -111,6 +170,20 @@ function App() {
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
   const [isStartingTraining, setIsStartingTraining] = useState(false)
   const [useSynthetic, setUseSynthetic] = useState(true)
+  const [queuePosition, setQueuePosition] = useState<number | null>(null)
+
+  // Community state
+  const [communityModels, setCommunityModels] = useState<CommunityModel[]>([])
+  const [communityLoading, setCommunityLoading] = useState(false)
+  const [sortBy, setSortBy] = useState<'downloads' | 'rating' | 'recent'>('downloads')
+  const [shareDescription, setShareDescription] = useState('')
+  const [shareContributor, setShareContributor] = useState('')
+  const [isSharing, setIsSharing] = useState(false)
+  const [userVotes, setUserVotes] = useState<Record<string, string>>({})
+
+  // Notification state
+  const [notificationsEnabled, setNotificationsEnabled] = useState(false)
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>('default')
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -126,6 +199,56 @@ function App() {
   const MIN_RECORDINGS = 20
   const RECOMMENDED_RECORDINGS = 50
   const OPTIMAL_RECORDINGS = 100
+
+  // Check notification permission on mount
+  useEffect(() => {
+    if ('Notification' in window) {
+      setNotificationPermission(Notification.permission)
+      setNotificationsEnabled(Notification.permission === 'granted')
+    }
+  }, [])
+
+  // Request notification permission
+  const requestNotificationPermission = async () => {
+    if ('Notification' in window) {
+      const permission = await Notification.requestPermission()
+      setNotificationPermission(permission)
+      setNotificationsEnabled(permission === 'granted')
+    }
+  }
+
+  // Send notification
+  const sendNotification = (title: string, body: string) => {
+    if (notificationsEnabled && 'Notification' in window) {
+      new Notification(title, {
+        body,
+        icon: '/wakeword-trainer/favicon.ico',
+        tag: 'wakeword-training'
+      })
+    }
+  }
+
+  // Load community models
+  const loadCommunityModels = async () => {
+    setCommunityLoading(true)
+    try {
+      const response = await fetch(`${API_BASE}/api/community?sort_by=${sortBy}`)
+      if (response.ok) {
+        const data = await response.json()
+        setCommunityModels(data.wake_words || [])
+      }
+    } catch (err) {
+      console.error('Failed to load community models:', err)
+    }
+    setCommunityLoading(false)
+  }
+
+  // Load community models when tab changes or sort changes
+  useEffect(() => {
+    if (activeTab === 'community') {
+      loadCommunityModels()
+    }
+  }, [activeTab, sortBy])
 
   // Create session when wake word is set
   const createSession = async (word: string) => {
@@ -194,6 +317,7 @@ function App() {
 
       const data = await response.json()
       setTrainingJob(data.job)
+      setQueuePosition(data.queue_position)
       setActiveTab('train')
 
       // Start polling for status
@@ -218,12 +342,20 @@ function App() {
 
         const data = await response.json()
         setTrainingJob(data.job)
+        setQueuePosition(data.queue_position)
 
         // Stop polling when complete or failed
         if (data.job.status === 'completed' || data.job.status === 'failed') {
           if (pollIntervalRef.current) {
             clearInterval(pollIntervalRef.current)
             pollIntervalRef.current = null
+          }
+
+          // Send notification
+          if (data.job.status === 'completed') {
+            sendNotification('Training Complete!', `Your wake word "${session?.wake_word}" is ready for download!`)
+          } else {
+            sendNotification('Training Failed', 'There was an error training your model. Please try again.')
           }
         }
       } catch (err) {
@@ -249,6 +381,91 @@ function App() {
       URL.revokeObjectURL(url)
     } catch (err) {
       setError('Failed to download model')
+    }
+  }
+
+  // Share to community
+  const shareToCommunnity = async () => {
+    if (!trainingJob || trainingJob.status !== 'completed') return
+
+    setIsSharing(true)
+    try {
+      const response = await fetch(`${API_BASE}/api/community`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          job_id: trainingJob.id,
+          description: shareDescription || undefined,
+          contributor: shareContributor || undefined,
+        }),
+      })
+
+      if (!response.ok) {
+        const data = await response.json()
+        throw new Error(data.detail || 'Failed to share')
+      }
+
+      alert('Successfully shared to community!')
+      setShareDescription('')
+      setShareContributor('')
+    } catch (err: any) {
+      setError(err.message || 'Failed to share to community')
+    }
+    setIsSharing(false)
+  }
+
+  // Download community model
+  const downloadCommunityModel = async (model: CommunityModel) => {
+    try {
+      const response = await fetch(`${API_BASE}/api/community/${model.id}/download`)
+      if (!response.ok) throw new Error('Download failed')
+
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${model.wake_word}.onnx`
+      a.click()
+      URL.revokeObjectURL(url)
+
+      // Refresh list to update download count
+      loadCommunityModels()
+    } catch (err) {
+      setError('Failed to download model')
+    }
+  }
+
+  // Vote on community model
+  const voteOnModel = async (modelId: string, vote: 'up' | 'down') => {
+    try {
+      const response = await fetch(`${API_BASE}/api/community/${modelId}/vote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          vote,
+          voter_id: getVoterId(),
+        }),
+      })
+
+      if (!response.ok) {
+        const data = await response.json()
+        throw new Error(data.detail || 'Vote failed')
+      }
+
+      const data = await response.json()
+
+      if (data.removed) {
+        alert('This model has been removed due to community votes.')
+      }
+
+      setUserVotes(prev => ({ ...prev, [modelId]: vote }))
+      loadCommunityModels()
+    } catch (err: any) {
+      if (err.message.includes('already voted')) {
+        alert('You have already voted on this model.')
+      } else {
+        console.error('Vote failed:', err)
+      }
     }
   }
 
@@ -418,6 +635,7 @@ function App() {
     setSession(null)
     setTrainingJob(null)
     setWakeWord('')
+    setQueuePosition(null)
     setActiveTab('record')
   }
 
@@ -629,7 +847,7 @@ function App() {
 
       {/* Tabs */}
       <div className="max-w-4xl mx-auto px-4 pt-6">
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           <button
             onClick={() => setActiveTab('record')}
             className={`px-6 py-3 rounded-t-lg font-medium transition ${activeTab === 'record' ? 'bg-white/10 text-white' : 'text-purple-300 hover:text-white'}`}
@@ -641,6 +859,12 @@ function App() {
             className={`px-6 py-3 rounded-t-lg font-medium transition ${activeTab === 'train' ? 'bg-white/10 text-white' : 'text-purple-300 hover:text-white'} ${!canTrain && !trainingJob ? 'opacity-50' : ''}`}
           >
             🧠 Train Model
+          </button>
+          <button
+            onClick={() => setActiveTab('community')}
+            className={`px-6 py-3 rounded-t-lg font-medium transition ${activeTab === 'community' ? 'bg-white/10 text-white' : 'text-purple-300 hover:text-white'}`}
+          >
+            🌐 Community
           </button>
           {session && (
             <button onClick={resetSession} className="ml-auto px-4 py-2 text-red-400 hover:text-red-300 text-sm">
@@ -823,10 +1047,36 @@ function App() {
               )}
             </section>
           </>
-        ) : (
+        ) : activeTab === 'train' ? (
           /* Train Tab */
           <section className="bg-white/10 backdrop-blur rounded-2xl rounded-tl-none p-6">
-            <h2 className="text-2xl font-bold text-white mb-6">🧠 Train Your Wake Word Model</h2>
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-2xl font-bold text-white">🧠 Train Your Wake Word Model</h2>
+
+              {/* Notification toggle */}
+              <div className="flex items-center gap-2">
+                {notificationPermission === 'granted' ? (
+                  <label className="flex items-center gap-2 text-sm text-purple-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={notificationsEnabled}
+                      onChange={(e) => setNotificationsEnabled(e.target.checked)}
+                      className="w-4 h-4 rounded"
+                    />
+                    🔔 Notify when done
+                  </label>
+                ) : notificationPermission === 'default' ? (
+                  <button
+                    onClick={requestNotificationPermission}
+                    className="text-sm text-purple-400 hover:text-white"
+                  >
+                    🔔 Enable notifications
+                  </button>
+                ) : (
+                  <span className="text-sm text-gray-500">🔕 Notifications blocked</span>
+                )}
+              </div>
+            </div>
 
             {!trainingJob ? (
               <>
@@ -891,6 +1141,22 @@ function App() {
                     {trainingJob.status.replace(/_/g, ' ')}
                   </h3>
                   <p className="text-purple-300 mt-2">{trainingJob.progress_message}</p>
+
+                  {/* Queue position */}
+                  {queuePosition !== null && queuePosition > 0 && (
+                    <div className="mt-4 p-3 bg-yellow-500/20 border border-yellow-500/30 rounded-lg inline-block">
+                      <p className="text-yellow-200">
+                        ⏳ Position in queue: <strong>#{queuePosition}</strong>
+                        <br />
+                        <span className="text-sm">Training runs one at a time. You'll be notified when it starts.</span>
+                      </p>
+                    </div>
+                  )}
+                  {queuePosition === 0 && trainingJob.status !== 'completed' && trainingJob.status !== 'failed' && (
+                    <div className="mt-4 p-3 bg-green-500/20 border border-green-500/30 rounded-lg inline-block">
+                      <p className="text-green-200">🚀 Currently training!</p>
+                    </div>
+                  )}
                 </div>
 
                 {/* Progress bar */}
@@ -906,16 +1172,49 @@ function App() {
 
                 {/* Download button */}
                 {trainingJob.status === 'completed' && (
-                  <div className="text-center">
-                    <button
-                      onClick={downloadModel}
-                      className="px-8 py-4 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-white rounded-lg font-bold text-lg transition transform hover:scale-105"
-                    >
-                      📥 Download {session?.wake_word}.onnx
-                    </button>
-                    <p className="text-purple-300 mt-4 text-sm">
-                      Use this ONNX model with OpenWakeWord, Home Assistant, or Knowledge Nexus.
-                    </p>
+                  <div className="space-y-6">
+                    <div className="text-center">
+                      <button
+                        onClick={downloadModel}
+                        className="px-8 py-4 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-white rounded-lg font-bold text-lg transition transform hover:scale-105"
+                      >
+                        📥 Download {session?.wake_word}.onnx
+                      </button>
+                      <p className="text-purple-300 mt-4 text-sm">
+                        Use this ONNX model with OpenWakeWord, Home Assistant, or Knowledge Nexus.
+                      </p>
+                    </div>
+
+                    {/* Share to community */}
+                    <div className="bg-white/5 rounded-lg p-6 border border-purple-500/30">
+                      <h3 className="text-white font-semibold mb-4">🌐 Share to Community</h3>
+                      <p className="text-purple-300 text-sm mb-4">
+                        Help others by sharing your trained model! Community members can download and vote on shared models.
+                      </p>
+                      <div className="space-y-3">
+                        <input
+                          type="text"
+                          value={shareContributor}
+                          onChange={(e) => setShareContributor(e.target.value)}
+                          placeholder="Your name (optional)"
+                          className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        />
+                        <input
+                          type="text"
+                          value={shareDescription}
+                          onChange={(e) => setShareDescription(e.target.value)}
+                          placeholder="Description (optional) - e.g., 'Good for home automation'"
+                          className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        />
+                        <button
+                          onClick={shareToCommunnity}
+                          disabled={isSharing}
+                          className="w-full py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-lg font-semibold transition"
+                        >
+                          {isSharing ? '⏳ Sharing...' : '🌐 Share to Community'}
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 )}
 
@@ -939,6 +1238,136 @@ function App() {
                 <strong>⏱️ Session Expiry:</strong> All recordings are automatically deleted after 24 hours. Make sure to complete your training and download your model before then!
               </p>
             </div>
+          </section>
+        ) : (
+          /* Community Tab */
+          <section className="bg-white/10 backdrop-blur rounded-2xl rounded-tl-none p-6">
+            <h2 className="text-2xl font-bold text-white mb-6">🌐 Community Wake Words</h2>
+
+            {/* Quality Guide */}
+            <div className="bg-gradient-to-r from-indigo-900/50 to-purple-900/50 rounded-xl p-6 mb-6 border border-indigo-500/30">
+              <h3 className="text-lg font-semibold text-white mb-3">📊 How to Evaluate Wake Word Quality</h3>
+              <div className="grid md:grid-cols-2 gap-4 text-sm">
+                <div>
+                  <h4 className="text-indigo-300 font-medium mb-2">Good Signs:</h4>
+                  <ul className="text-indigo-200 space-y-1">
+                    <li>✅ <strong>50+ recordings</strong> - More training data = better accuracy</li>
+                    <li>✅ <strong>Uses synthetic samples</strong> - Adds voice variety</li>
+                    <li>✅ <strong>High upvote ratio</strong> - Community verified</li>
+                    <li>✅ <strong>2-4 syllable phrase</strong> - Easier to detect reliably</li>
+                  </ul>
+                </div>
+                <div>
+                  <h4 className="text-red-300 font-medium mb-2">Warning Signs:</h4>
+                  <ul className="text-red-200 space-y-1">
+                    <li>⚠️ <strong>Under 30 recordings</strong> - May have false positives</li>
+                    <li>⚠️ <strong>Common words</strong> - "Hey" alone triggers often</li>
+                    <li>⚠️ <strong>Low/no votes</strong> - Untested by community</li>
+                    <li>⚠️ <strong>More downvotes</strong> - Likely quality issues</li>
+                  </ul>
+                </div>
+              </div>
+              <p className="text-indigo-300 text-xs mt-4">
+                <strong>Note:</strong> Models with more downvotes than upvotes (and 10+ total votes) are automatically removed.
+              </p>
+            </div>
+
+            {/* Sort options */}
+            <div className="flex gap-2 mb-6">
+              <span className="text-purple-300 text-sm py-2">Sort by:</span>
+              {(['downloads', 'rating', 'recent'] as const).map(option => (
+                <button
+                  key={option}
+                  onClick={() => setSortBy(option)}
+                  className={`px-4 py-2 rounded-lg text-sm transition ${
+                    sortBy === option
+                      ? 'bg-purple-600 text-white'
+                      : 'bg-white/10 text-purple-300 hover:text-white'
+                  }`}
+                >
+                  {option === 'downloads' ? '📥 Downloads' : option === 'rating' ? '⭐ Rating' : '🕐 Recent'}
+                </button>
+              ))}
+              <button
+                onClick={loadCommunityModels}
+                className="ml-auto px-4 py-2 bg-white/10 text-purple-300 hover:text-white rounded-lg text-sm transition"
+              >
+                🔄 Refresh
+              </button>
+            </div>
+
+            {/* Models list */}
+            {communityLoading ? (
+              <div className="text-center py-12">
+                <div className="text-4xl animate-pulse mb-4">⏳</div>
+                <p className="text-purple-300">Loading community models...</p>
+              </div>
+            ) : communityModels.length === 0 ? (
+              <div className="text-center py-12">
+                <div className="text-4xl mb-4">📭</div>
+                <p className="text-purple-300 text-lg">No community models yet</p>
+                <p className="text-purple-400 text-sm mt-2">Be the first to share! Train a model and share it with the community.</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {communityModels.map(model => (
+                  <div key={model.id} className="bg-white/5 rounded-xl p-5 hover:bg-white/10 transition border border-white/10">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-3 mb-2">
+                          <h3 className="text-xl font-bold text-white">"{model.wake_word}"</h3>
+                          <QualityScore model={model} />
+                        </div>
+                        {model.description && (
+                          <p className="text-purple-300 text-sm mb-2">{model.description}</p>
+                        )}
+                        <div className="flex flex-wrap gap-3 text-xs text-purple-400">
+                          <span>📥 {model.download_count} downloads</span>
+                          <span>🎙️ {model.recording_count} recordings</span>
+                          {model.used_synthetic && <span>🤖 Synthetic enhanced</span>}
+                          {model.contributor && <span>👤 {model.contributor}</span>}
+                          <span>📅 {new Date(model.created_at).toLocaleDateString()}</span>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col gap-2 items-end">
+                        {/* Voting */}
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => voteOnModel(model.id, 'up')}
+                            className={`px-3 py-1 rounded-lg text-sm transition ${
+                              userVotes[model.id] === 'up'
+                                ? 'bg-green-600 text-white'
+                                : 'bg-white/10 text-green-400 hover:bg-green-600/30'
+                            }`}
+                          >
+                            👍 {model.thumbs_up}
+                          </button>
+                          <button
+                            onClick={() => voteOnModel(model.id, 'down')}
+                            className={`px-3 py-1 rounded-lg text-sm transition ${
+                              userVotes[model.id] === 'down'
+                                ? 'bg-red-600 text-white'
+                                : 'bg-white/10 text-red-400 hover:bg-red-600/30'
+                            }`}
+                          >
+                            👎 {model.thumbs_down}
+                          </button>
+                        </div>
+
+                        {/* Download */}
+                        <button
+                          onClick={() => downloadCommunityModel(model)}
+                          className="px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg text-sm font-medium transition"
+                        >
+                          📥 Download
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
         )}
       </main>
