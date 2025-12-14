@@ -632,30 +632,42 @@ function App() {
       setRecordingTime(0)
 
       const startTime = Date.now()
+
+      // AUTO-STOP: Use setTimeout to guarantee stop after exactly 3 seconds
+      const autoStopTimeout = setTimeout(() => {
+        if (mediaRecorder.state === 'recording') {
+          mediaRecorder.stop()
+          setIsRecording(false)
+          if (timerRef.current) {
+            clearInterval(timerRef.current)
+            timerRef.current = null
+          }
+        }
+      }, TARGET_DURATION * 1000)
+
       timerRef.current = window.setInterval(() => {
         const elapsed = (Date.now() - startTime) / 1000
-        setRecordingTime(elapsed)
+        setRecordingTime(Math.min(elapsed, TARGET_DURATION))
 
         if (elapsed < SPEAK_START) {
           setRecordingPhase('listen')
         } else if (elapsed < SPEAK_END) {
           setRecordingPhase('speak')
-        } else {
+        } else if (elapsed < TARGET_DURATION) {
           setRecordingPhase('listen')
         }
 
-        // Auto-stop after TARGET_DURATION - inline to avoid closure issues
+        // Clear interval when done (timeout handles the actual stop)
         if (elapsed >= TARGET_DURATION) {
-          if (mediaRecorder.state === 'recording') {
-            mediaRecorder.stop()
-            setIsRecording(false)
-            if (timerRef.current) {
-              clearInterval(timerRef.current)
-              timerRef.current = null
-            }
-          }
+          clearInterval(timerRef.current!)
+          timerRef.current = null
         }
       }, 50)
+
+      // Store timeout ref for cleanup if user manually stops
+      mediaRecorder.addEventListener('stop', () => {
+        clearTimeout(autoStopTimeout)
+      }, { once: true })
 
     } catch (err) {
       setError('Microphone access denied. Please allow microphone access and try again.')
