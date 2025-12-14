@@ -578,7 +578,7 @@ function App() {
   }, [session, wakeWord])
 
   const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop()
       setIsRecording(false)
       if (timerRef.current) {
@@ -586,7 +586,7 @@ function App() {
         timerRef.current = null
       }
     }
-  }, [isRecording])
+  }, [])
 
   const deleteSample = useCallback(async (id: string) => {
     if (session) {
