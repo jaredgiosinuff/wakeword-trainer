@@ -644,8 +644,16 @@ function App() {
           setRecordingPhase('listen')
         }
 
+        // Auto-stop after TARGET_DURATION - inline to avoid closure issues
         if (elapsed >= TARGET_DURATION) {
-          stopRecording()
+          if (mediaRecorder.state === 'recording') {
+            mediaRecorder.stop()
+            setIsRecording(false)
+            if (timerRef.current) {
+              clearInterval(timerRef.current)
+              timerRef.current = null
+            }
+          }
         }
       }, 50)
 
