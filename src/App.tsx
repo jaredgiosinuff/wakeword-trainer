@@ -1,5 +1,4 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import JSZip from 'jszip'
 
 // Types
 interface AudioSample {
@@ -8,36 +7,29 @@ interface AudioSample {
   url: string
   duration: number
   timestamp: Date
+  uploaded: boolean
 }
 
-interface CommunityWakeword {
+interface Session {
   id: string
-  name: string
-  displayName: string
-  description: string
-  sampleCount: number
-  ratingCount: number
-  averageRating: number
-  weightedRating: number
-  createdAt: string
+  wake_word: string
+  recording_count: number
+  status: string
 }
 
-type Tab = 'record' | 'browse'
-type SortBy = 'weightedRating' | 'sampleCount' | 'name' | 'createdAt'
+interface TrainingJob {
+  id: string
+  status: string
+  progress: number
+  progress_message: string
+  model_path?: string
+}
+
+type Tab = 'record' | 'train'
 type RecordingPhase = 'ready' | 'countdown' | 'listen' | 'speak' | 'done'
 
 // API base URL - configure for your deployment
-const API_BASE = import.meta.env.VITE_API_URL || ''
-
-// Get or create visitor ID for rating tracking
-function getVisitorId(): string {
-  let id = localStorage.getItem('wakeword_visitor_id')
-  if (!id) {
-    id = crypto.randomUUID()
-    localStorage.setItem('wakeword_visitor_id', id)
-  }
-  return id
-}
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8400'
 
 // Tooltip component
 function Tooltip({ children, text }: { children: React.ReactNode; text: string }) {
@@ -98,24 +90,23 @@ function App() {
   const [activeTab, setActiveTab] = useState<Tab>('record')
   const [showQuickStart, setShowQuickStart] = useState(true)
 
-  // Recording state
+  // Session state
+  const [session, setSession] = useState<Session | null>(null)
   const [wakeWord, setWakeWord] = useState('')
+
+  // Recording state
   const [samples, setSamples] = useState<AudioSample[]>([])
   const [isRecording, setIsRecording] = useState(false)
   const [recordingTime, setRecordingTime] = useState(0)
   const [recordingPhase, setRecordingPhase] = useState<RecordingPhase>('ready')
   const [error, setError] = useState<string | null>(null)
   const [playingId, setPlayingId] = useState<string | null>(null)
-  const [agreedToShare, setAgreedToShare] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
-  const [uploadProgress, setUploadProgress] = useState('')
 
-  // Browse state
-  const [communityWakewords, setCommunityWakewords] = useState<CommunityWakeword[]>([])
-  const [searchQuery, setSearchQuery] = useState('')
-  const [sortBy, setSortBy] = useState<SortBy>('weightedRating')
-  const [isLoading, setIsLoading] = useState(false)
-  const [userRatings, setUserRatings] = useState<Record<string, number>>({})
+  // Training state
+  const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
+  const [isStartingTraining, setIsStartingTraining] = useState(false)
+  const [useSynthetic, setUseSynthetic] = useState(true)
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -123,52 +114,137 @@ function App() {
   const timerRef = useRef<number | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const pollIntervalRef = useRef<number | null>(null)
 
   const TARGET_DURATION = 3.0
-  const SPEAK_START = 0.5  // Start speaking at 0.5s
-  const SPEAK_END = 2.0    // Stop speaking by 2.0s
+  const SPEAK_START = 0.5
+  const SPEAK_END = 2.0
+  const MIN_RECORDINGS = 20
+  const RECOMMENDED_RECORDINGS = 50
+  const OPTIMAL_RECORDINGS = 100
 
-  // Fetch community wakewords
-  const fetchWakewords = useCallback(async () => {
-    if (!API_BASE) return
-
-    setIsLoading(true)
+  // Create session when wake word is set
+  const createSession = async (word: string) => {
     try {
-      const params = new URLSearchParams({
-        sortBy,
-        sortOrder: sortBy === 'name' ? 'asc' : 'desc',
-        ...(searchQuery && { search: searchQuery }),
-      })
-      const response = await fetch(`${API_BASE}/wakewords?${params}`)
-      const data = await response.json()
-      setCommunityWakewords(data.wakewords || [])
-    } catch (err) {
-      console.error('Failed to fetch wakewords:', err)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [searchQuery, sortBy])
-
-  useEffect(() => {
-    if (activeTab === 'browse') {
-      fetchWakewords()
-    }
-  }, [activeTab, fetchWakewords])
-
-  // Rate a wakeword
-  const rateWakeword = async (wakewordId: string, rating: number) => {
-    if (!API_BASE) return
-
-    try {
-      await fetch(`${API_BASE}/wakewords/${wakewordId}/rate`, {
+      const response = await fetch(`${API_BASE}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rating, visitorId: getVisitorId() }),
+        body: JSON.stringify({ wake_word: word }),
       })
-      setUserRatings(prev => ({ ...prev, [wakewordId]: rating }))
-      fetchWakewords()
+
+      if (!response.ok) throw new Error('Failed to create session')
+
+      const data = await response.json()
+      setSession({ id: data.session_id, wake_word: word, recording_count: 0, status: 'recording' })
+      setSamples([])
+      setTrainingJob(null)
+      return data.session_id
     } catch (err) {
-      console.error('Failed to rate:', err)
+      console.error('Session creation failed:', err)
+      setError('Failed to connect to server. Running in local-only mode.')
+      return null
+    }
+  }
+
+  // Upload recording to server
+  const uploadRecording = async (sessionId: string, blob: Blob) => {
+    try {
+      const formData = new FormData()
+      formData.append('file', blob, 'recording.webm')
+
+      const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/recordings`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!response.ok) throw new Error('Upload failed')
+
+      const data = await response.json()
+      return data
+    } catch (err) {
+      console.error('Upload failed:', err)
+      return null
+    }
+  }
+
+  // Start training
+  const startTraining = async () => {
+    if (!session) return
+
+    setIsStartingTraining(true)
+    try {
+      const response = await fetch(`${API_BASE}/api/sessions/${session.id}/train`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          use_synthetic: useSynthetic,
+          synthetic_voices: 10,
+          augmentation_factor: 5,
+        }),
+      })
+
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.detail || 'Failed to start training')
+      }
+
+      const data = await response.json()
+      setTrainingJob(data.job)
+      setActiveTab('train')
+
+      // Start polling for status
+      startPollingTrainingStatus(data.job.id)
+    } catch (err: any) {
+      setError(err.message || 'Failed to start training')
+    } finally {
+      setIsStartingTraining(false)
+    }
+  }
+
+  // Poll training status
+  const startPollingTrainingStatus = (jobId: string) => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current)
+    }
+
+    pollIntervalRef.current = window.setInterval(async () => {
+      try {
+        const response = await fetch(`${API_BASE}/api/training/${jobId}`)
+        if (!response.ok) return
+
+        const data = await response.json()
+        setTrainingJob(data.job)
+
+        // Stop polling when complete or failed
+        if (data.job.status === 'completed' || data.job.status === 'failed') {
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current)
+            pollIntervalRef.current = null
+          }
+        }
+      } catch (err) {
+        console.error('Status poll failed:', err)
+      }
+    }, 2000)
+  }
+
+  // Download trained model
+  const downloadModel = async () => {
+    if (!trainingJob) return
+
+    try {
+      const response = await fetch(`${API_BASE}/api/training/${trainingJob.id}/download`)
+      if (!response.ok) throw new Error('Download failed')
+
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${session?.wake_word || 'wakeword'}.onnx`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError('Failed to download model')
     }
   }
 
@@ -178,6 +254,15 @@ function App() {
       setError(null)
       chunksRef.current = []
       setRecordingPhase('countdown')
+
+      // Create session if needed
+      let currentSession = session
+      if (!currentSession && wakeWord.trim()) {
+        const sessionId = await createSession(wakeWord.trim())
+        if (sessionId) {
+          currentSession = { id: sessionId, wake_word: wakeWord.trim(), recording_count: 0, status: 'recording' }
+        }
+      }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -217,10 +302,24 @@ function App() {
           blob,
           url,
           duration: audio.duration,
-          timestamp: new Date()
+          timestamp: new Date(),
+          uploaded: false,
+        }
+
+        // Upload to server if we have a session
+        if (currentSession) {
+          setIsUploading(true)
+          const result = await uploadRecording(currentSession.id, blob)
+          if (result) {
+            sample.uploaded = true
+            sample.id = result.recording_id
+            setSession(prev => prev ? { ...prev, recording_count: result.total_recordings } : null)
+          }
+          setIsUploading(false)
         }
 
         setSamples(prev => [...prev, sample])
+
         if (streamRef.current) {
           streamRef.current.getTracks().forEach(track => track.stop())
         }
@@ -237,7 +336,6 @@ function App() {
         const elapsed = (Date.now() - startTime) / 1000
         setRecordingTime(elapsed)
 
-        // Update recording phase
         if (elapsed < SPEAK_START) {
           setRecordingPhase('listen')
         } else if (elapsed < SPEAK_END) {
@@ -256,7 +354,7 @@ function App() {
       setRecordingPhase('ready')
       console.error(err)
     }
-  }, [])
+  }, [session, wakeWord])
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
@@ -269,13 +367,25 @@ function App() {
     }
   }, [isRecording])
 
-  const deleteSample = useCallback((id: string) => {
+  const deleteSample = useCallback(async (id: string) => {
+    if (session) {
+      try {
+        await fetch(`${API_BASE}/api/sessions/${session.id}/recordings/${id}`, {
+          method: 'DELETE',
+        })
+      } catch (err) {
+        console.error('Delete failed:', err)
+      }
+    }
+
     setSamples(prev => {
       const sample = prev.find(s => s.id === id)
       if (sample) URL.revokeObjectURL(sample.url)
       return prev.filter(s => s.id !== id)
     })
-  }, [])
+
+    setSession(prev => prev ? { ...prev, recording_count: Math.max(0, prev.recording_count - 1) } : null)
+  }, [session])
 
   const playSample = useCallback((sample: AudioSample) => {
     if (audioRef.current) audioRef.current.pause()
@@ -294,112 +404,24 @@ function App() {
     setPlayingId(null)
   }, [])
 
-  // Upload samples to community
-  const uploadToCommunity = async () => {
-    if (!API_BASE || samples.length === 0 || !agreedToShare) return
-
-    setIsUploading(true)
-    setUploadProgress('Creating wakeword entry...')
-
-    try {
-      const createRes = await fetch(`${API_BASE}/wakewords`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: wakeWord, agreedToShare: true }),
-      })
-      const { wakeword } = await createRes.json()
-
-      for (let i = 0; i < samples.length; i++) {
-        setUploadProgress(`Uploading sample ${i + 1}/${samples.length}...`)
-
-        const sample = samples[i]
-        const urlRes = await fetch(`${API_BASE}/wakewords/${wakeword.id}/samples`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            filename: `${wakeWord}_${i + 1}.webm`,
-            contentType: 'audio/webm',
-            duration: sample.duration,
-            agreedToShare: true,
-          }),
-        })
-        const { uploadUrl } = await urlRes.json()
-
-        await fetch(uploadUrl, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'audio/webm' },
-          body: sample.blob,
-        })
-      }
-
-      setUploadProgress('Upload complete!')
-      setTimeout(() => {
-        setUploadProgress('')
-        setIsUploading(false)
-        samples.forEach(s => URL.revokeObjectURL(s.url))
-        setSamples([])
-        setWakeWord('')
-        setAgreedToShare(false)
-      }, 2000)
-
-    } catch (err) {
-      console.error('Upload failed:', err)
-      setError('Upload failed. Please try again.')
-      setIsUploading(false)
-      setUploadProgress('')
+  // Reset session
+  const resetSession = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current)
     }
+    samples.forEach(s => URL.revokeObjectURL(s.url))
+    setSamples([])
+    setSession(null)
+    setTrainingJob(null)
+    setWakeWord('')
+    setActiveTab('record')
   }
-
-  // Export locally
-  const exportSamples = useCallback(async () => {
-    if (samples.length === 0) return
-
-    const zip = new JSZip()
-    const folder = zip.folder(wakeWord.replace(/\s+/g, '_').toLowerCase() || 'wakeword')!
-
-    for (let i = 0; i < samples.length; i++) {
-      const sample = samples[i]
-      const filename = `${wakeWord.replace(/\s+/g, '_').toLowerCase() || 'sample'}_${String(i + 1).padStart(3, '0')}.webm`
-      folder.file(filename, sample.blob)
-    }
-
-    const metadata = {
-      wakeWord,
-      sampleCount: samples.length,
-      exportDate: new Date().toISOString(),
-      format: 'webm (convert to 16kHz mono WAV for training)',
-      targetDuration: TARGET_DURATION,
-      instructions: 'Each sample contains ONE utterance of the wake word. Convert to WAV using the included script before training.',
-    }
-    folder.file('metadata.json', JSON.stringify(metadata, null, 2))
-
-    const convertScript = `#!/bin/bash
-# Convert WebM samples to 16kHz mono WAV for OpenWakeWord training
-mkdir -p wav_output
-for f in *.webm; do
-  if [ -f "$f" ]; then
-    name="\${f%.webm}"
-    ffmpeg -i "$f" -ar 16000 -ac 1 "wav_output/\${name}.wav" -y
-  fi
-done
-echo "Done! WAV files are in wav_output/"
-echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
-`
-    folder.file('convert_to_wav.sh', convertScript)
-
-    const content = await zip.generateAsync({ type: 'blob' })
-    const url = URL.createObjectURL(content)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${wakeWord.replace(/\s+/g, '_').toLowerCase() || 'wakeword'}_samples.zip`
-    a.click()
-    URL.revokeObjectURL(url)
-  }, [samples, wakeWord])
 
   useEffect(() => {
     return () => {
       samples.forEach(s => URL.revokeObjectURL(s.url))
       if (timerRef.current) clearInterval(timerRef.current)
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
     }
   }, [])
 
@@ -407,33 +429,13 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
   const getRecordingUI = () => {
     switch (recordingPhase) {
       case 'countdown':
-        return {
-          color: 'bg-yellow-500',
-          icon: '⏳',
-          text: 'Get ready...',
-          subtext: 'Microphone activating'
-        }
+        return { color: 'bg-yellow-500', icon: '⏳', text: 'Get ready...', subtext: 'Microphone activating' }
       case 'listen':
-        return {
-          color: 'bg-blue-500',
-          icon: '👂',
-          text: 'Silence',
-          subtext: recordingTime < SPEAK_START ? 'Wait for the cue...' : 'Hold silence...'
-        }
+        return { color: 'bg-blue-500', icon: '👂', text: 'Silence', subtext: recordingTime < SPEAK_START ? 'Wait for the cue...' : 'Hold silence...' }
       case 'speak':
-        return {
-          color: 'bg-green-500 animate-pulse',
-          icon: '🗣️',
-          text: `Say "${wakeWord}" NOW!`,
-          subtext: 'Speak clearly, one time only'
-        }
+        return { color: 'bg-green-500 animate-pulse', icon: '🗣️', text: `Say "${wakeWord}" NOW!`, subtext: 'Speak clearly, one time only' }
       case 'done':
-        return {
-          color: 'bg-purple-500',
-          icon: '✅',
-          text: 'Sample saved!',
-          subtext: 'Ready for another'
-        }
+        return { color: 'bg-purple-500', icon: '✅', text: 'Sample saved!', subtext: isUploading ? 'Uploading...' : 'Ready for another' }
       default:
         return {
           color: wakeWord.trim() ? 'bg-purple-600 hover:bg-purple-500' : 'bg-gray-600',
@@ -445,37 +447,8 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
   }
 
   const ui = getRecordingUI()
-
-  // Star rating component
-  const StarRating = ({ wakewordId, currentRating, userRating, ratingCount }: {
-    wakewordId: string
-    currentRating: number
-    userRating?: number
-    ratingCount: number
-  }) => (
-    <div className="flex items-center gap-2">
-      <div className="flex">
-        {[1, 2, 3, 4, 5].map(star => (
-          <button
-            key={star}
-            onClick={() => rateWakeword(wakewordId, star)}
-            className={`text-xl transition ${
-              star <= (userRating || 0)
-                ? 'text-yellow-400'
-                : star <= currentRating
-                  ? 'text-yellow-400/50'
-                  : 'text-gray-600 hover:text-yellow-400/70'
-            }`}
-          >
-            ★
-          </button>
-        ))}
-      </div>
-      <span className="text-purple-300 text-sm">
-        {currentRating.toFixed(1)} ({ratingCount})
-      </span>
-    </div>
-  )
+  const recordingCount = session?.recording_count || samples.length
+  const canTrain = recordingCount >= MIN_RECORDINGS
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
@@ -484,8 +457,21 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
         <div className="max-w-4xl mx-auto px-4 py-6">
           <h1 className="text-3xl font-bold text-white">Wake Word Trainer</h1>
           <p className="text-purple-300 mt-1">
-            Record samples for training custom OpenWakeWord models
+            Record, train, and download custom OpenWakeWord models
           </p>
+          {session && (
+            <div className="mt-2 flex items-center gap-4">
+              <span className="text-green-400 text-sm">
+                ✓ Session active for "{session.wake_word}"
+              </span>
+              <span className="text-purple-400 text-sm">
+                ({recordingCount} recordings)
+              </span>
+              <span className="text-yellow-400 text-sm animate-pulse">
+                ⏱️ Auto-expires in 24 hours
+              </span>
+            </div>
+          )}
         </div>
       </header>
 
@@ -497,10 +483,7 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
               <h2 className="text-xl font-bold text-white flex items-center gap-2">
                 <span className="text-2xl">📖</span> Quick Start Guide
               </h2>
-              <button
-                onClick={() => setShowQuickStart(false)}
-                className="text-purple-400 hover:text-white text-sm"
-              >
+              <button onClick={() => setShowQuickStart(false)} className="text-purple-400 hover:text-white text-sm">
                 Hide ✕
               </button>
             </div>
@@ -512,61 +495,25 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
                   How Each Recording Works
                 </h3>
                 <ol className="space-y-2 text-purple-200 text-sm">
-                  <li className="flex gap-2">
-                    <span className="text-blue-400 font-mono">0.0-0.5s</span>
-                    <span>👂 Silence - get ready</span>
-                  </li>
-                  <li className="flex gap-2">
-                    <span className="text-green-400 font-mono">0.5-2.0s</span>
-                    <span>🗣️ <strong>Say your wake word ONCE</strong></span>
-                  </li>
-                  <li className="flex gap-2">
-                    <span className="text-blue-400 font-mono">2.0-3.0s</span>
-                    <span>👂 Silence - let it finish</span>
-                  </li>
+                  <li className="flex gap-2"><span className="text-blue-400 font-mono">0.0-0.5s</span><span>👂 Silence - get ready</span></li>
+                  <li className="flex gap-2"><span className="text-green-400 font-mono">0.5-2.0s</span><span>🗣️ <strong>Say your wake word ONCE</strong></span></li>
+                  <li className="flex gap-2"><span className="text-blue-400 font-mono">2.0-3.0s</span><span>👂 Silence - let it finish</span></li>
                 </ol>
-
                 <div className="mt-4 p-3 bg-yellow-500/20 border border-yellow-500/30 rounded-lg">
-                  <p className="text-yellow-200 text-sm">
-                    <strong>Important:</strong> Say the wake word <strong>exactly ONE time</strong> per recording.
-                    The model learns from the silence before and after.
-                  </p>
+                  <p className="text-yellow-200 text-sm"><strong>Important:</strong> Say the wake word <strong>exactly ONE time</strong> per recording.</p>
                 </div>
               </div>
-
               <div>
                 <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
                   <span className="w-6 h-6 bg-purple-500 rounded-full flex items-center justify-center text-sm">🎯</span>
                   Tips for Better Training
                 </h3>
                 <ul className="space-y-2 text-purple-200 text-sm">
-                  <li className="flex gap-2">
-                    <span>🔊</span>
-                    <span>Vary your <strong>volume</strong> - quiet, normal, loud</span>
-                  </li>
-                  <li className="flex gap-2">
-                    <span>📏</span>
-                    <span>Vary your <strong>distance</strong> - close and far from mic</span>
-                  </li>
-                  <li className="flex gap-2">
-                    <span>⏱️</span>
-                    <span>Vary your <strong>speed</strong> - slow, normal, fast</span>
-                  </li>
-                  <li className="flex gap-2">
-                    <span>🎭</span>
-                    <span>Vary your <strong>tone</strong> - tired, excited, questioning</span>
-                  </li>
-                  <li className="flex gap-2">
-                    <span>👥</span>
-                    <span>Get <strong>multiple people</strong> if possible</span>
-                  </li>
+                  <li className="flex gap-2"><span>🔊</span><span>Vary your <strong>volume</strong> - quiet, normal, loud</span></li>
+                  <li className="flex gap-2"><span>📏</span><span>Vary your <strong>distance</strong> - close and far from mic</span></li>
+                  <li className="flex gap-2"><span>⏱️</span><span>Vary your <strong>speed</strong> - slow, normal, fast</span></li>
+                  <li className="flex gap-2"><span>🎭</span><span>Vary your <strong>tone</strong> - tired, excited, questioning</span></li>
                 </ul>
-
-                <div className="mt-4 p-3 bg-purple-500/20 border border-purple-500/30 rounded-lg">
-                  <p className="text-purple-200 text-sm">
-                    <strong>Goal:</strong> 50-100+ diverse samples create robust models that work in real conditions.
-                  </p>
-                </div>
               </div>
             </div>
           </div>
@@ -578,29 +525,23 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
         <div className="flex gap-2">
           <button
             onClick={() => setActiveTab('record')}
-            className={`px-6 py-3 rounded-t-lg font-medium transition ${
-              activeTab === 'record'
-                ? 'bg-white/10 text-white'
-                : 'text-purple-300 hover:text-white'
-            }`}
+            className={`px-6 py-3 rounded-t-lg font-medium transition ${activeTab === 'record' ? 'bg-white/10 text-white' : 'text-purple-300 hover:text-white'}`}
           >
-            🎙️ Record
+            🎙️ Record ({recordingCount})
           </button>
           <button
-            onClick={() => setActiveTab('browse')}
-            className={`px-6 py-3 rounded-t-lg font-medium transition ${
-              activeTab === 'browse'
-                ? 'bg-white/10 text-white'
-                : 'text-purple-300 hover:text-white'
-            }`}
+            onClick={() => setActiveTab('train')}
+            className={`px-6 py-3 rounded-t-lg font-medium transition ${activeTab === 'train' ? 'bg-white/10 text-white' : 'text-purple-300 hover:text-white'} ${!canTrain && !trainingJob ? 'opacity-50' : ''}`}
           >
-            🔍 Browse Community
+            🧠 Train Model
           </button>
+          {session && (
+            <button onClick={resetSession} className="ml-auto px-4 py-2 text-red-400 hover:text-red-300 text-sm">
+              🔄 Start Over
+            </button>
+          )}
           {!showQuickStart && activeTab === 'record' && (
-            <button
-              onClick={() => setShowQuickStart(true)}
-              className="ml-auto px-4 py-2 text-purple-400 hover:text-white text-sm"
-            >
+            <button onClick={() => setShowQuickStart(true)} className="px-4 py-2 text-purple-400 hover:text-white text-sm">
               📖 Show Guide
             </button>
           )}
@@ -614,7 +555,7 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
             <section className="bg-white/10 backdrop-blur rounded-2xl rounded-tl-none p-6 mb-6">
               <label className="block text-white font-medium mb-2">
                 Wake Word / Phrase
-                <Tooltip text="Choose a word or short phrase that will activate your voice assistant. 2-4 syllables work best. Examples: 'Hey Jarvis', 'Computer', 'OK Nexus'">
+                <Tooltip text="Choose a word or short phrase that will activate your voice assistant. 2-4 syllables work best.">
                   <InfoIcon />
                 </Tooltip>
               </label>
@@ -623,36 +564,31 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
                 value={wakeWord}
                 onChange={(e) => setWakeWord(e.target.value)}
                 placeholder='e.g., "Hey Nexus" or "Computer"'
-                className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500 text-lg"
+                disabled={!!session}
+                className={`w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500 text-lg ${session ? 'opacity-50 cursor-not-allowed' : ''}`}
               />
-              <div className="flex gap-4 mt-2 text-sm text-purple-300">
-                <span>💡 Good: 2-4 syllables</span>
-                <span>💡 Unique sounds</span>
-                <span>💡 Easy to say</span>
-              </div>
+              {session && (
+                <p className="text-purple-400 text-sm mt-2">Wake word locked for this session. Click "Start Over" to change.</p>
+              )}
             </section>
 
             {/* Recording Section */}
             <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-6">
               <div className="flex flex-col items-center">
-                {/* Main record button */}
                 <button
                   onClick={isRecording ? stopRecording : startRecording}
-                  disabled={!wakeWord.trim() || recordingPhase === 'countdown'}
+                  disabled={!wakeWord.trim() || recordingPhase === 'countdown' || isUploading}
                   className={`relative w-36 h-36 rounded-full flex flex-col items-center justify-center text-white transition-all shadow-lg ${
-                    isRecording ? ui.color : (wakeWord.trim() ? 'bg-purple-600 hover:bg-purple-500 hover:scale-105' : 'bg-gray-600 cursor-not-allowed opacity-50')
+                    isRecording ? ui.color : (wakeWord.trim() && !isUploading ? 'bg-purple-600 hover:bg-purple-500 hover:scale-105' : 'bg-gray-600 cursor-not-allowed opacity-50')
                   }`}
                 >
-                  <span className="text-5xl">{isRecording ? ui.icon : '🎙️'}</span>
+                  <span className="text-5xl">{isRecording ? ui.icon : (isUploading ? '⏳' : '🎙️')}</span>
                 </button>
 
-                {/* Status text */}
                 <div className="mt-4 text-center min-h-[80px]">
                   {isRecording ? (
                     <>
-                      <p className={`text-xl font-bold ${recordingPhase === 'speak' ? 'text-green-400' : 'text-white'}`}>
-                        {ui.text}
-                      </p>
+                      <p className={`text-xl font-bold ${recordingPhase === 'speak' ? 'text-green-400' : 'text-white'}`}>{ui.text}</p>
                       <p className="text-purple-300 mt-1">{ui.subtext}</p>
                       <div className="flex items-center justify-center gap-2 mt-2">
                         <span className="text-2xl font-mono text-white">{recordingTime.toFixed(1)}s</span>
@@ -661,7 +597,7 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
                     </>
                   ) : (
                     <>
-                      <p className="text-white text-lg">{ui.text}</p>
+                      <p className="text-white text-lg">{isUploading ? 'Uploading...' : ui.text}</p>
                       {ui.subtext && <p className="text-purple-300 text-sm mt-1">{ui.subtext}</p>}
                     </>
                   )}
@@ -671,18 +607,12 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
                 {isRecording && (
                   <div className="w-full max-w-md mt-4">
                     <div className="relative h-8 bg-white/10 rounded-full overflow-hidden">
-                      {/* Sections */}
                       <div className="absolute inset-0 flex">
-                        <div className="w-[16.7%] bg-blue-500/30 border-r border-white/20" title="Silence" />
-                        <div className="w-[50%] bg-green-500/30 border-r border-white/20" title="Speak" />
-                        <div className="w-[33.3%] bg-blue-500/30" title="Silence" />
+                        <div className="w-[16.7%] bg-blue-500/30 border-r border-white/20" />
+                        <div className="w-[50%] bg-green-500/30 border-r border-white/20" />
+                        <div className="w-[33.3%] bg-blue-500/30" />
                       </div>
-                      {/* Progress indicator */}
-                      <div
-                        className="absolute top-0 bottom-0 w-1 bg-white shadow-lg transition-all duration-50"
-                        style={{ left: `${(recordingTime / TARGET_DURATION) * 100}%` }}
-                      />
-                      {/* Labels */}
+                      <div className="absolute top-0 bottom-0 w-1 bg-white shadow-lg" style={{ left: `${(recordingTime / TARGET_DURATION) * 100}%` }} />
                       <div className="absolute inset-0 flex items-center text-xs text-white/70 pointer-events-none">
                         <span className="w-[16.7%] text-center">👂</span>
                         <span className="w-[50%] text-center font-bold text-white">🗣️ SPEAK</span>
@@ -690,19 +620,14 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
                       </div>
                     </div>
                     <div className="flex justify-between text-xs text-purple-400 mt-1">
-                      <span>0s</span>
-                      <span>0.5s</span>
-                      <span>2.0s</span>
-                      <span>3.0s</span>
+                      <span>0s</span><span>0.5s</span><span>2.0s</span><span>3.0s</span>
                     </div>
                   </div>
                 )}
               </div>
 
               {error && (
-                <div className="mt-4 p-4 bg-red-500/20 border border-red-500/50 rounded-lg text-red-200">
-                  {error}
-                </div>
+                <div className="mt-4 p-4 bg-red-500/20 border border-red-500/50 rounded-lg text-red-200">{error}</div>
               )}
             </section>
 
@@ -710,67 +635,56 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
             <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-6">
               <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
                 📊 Training Progress
-                <Tooltip text="More samples = better model. Aim for at least 50 samples with good variety. 100+ samples create highly accurate models.">
+                <Tooltip text="More samples = better model. Aim for at least 50 samples with good variety.">
                   <InfoIcon />
                 </Tooltip>
               </h2>
 
-              <ProgressBar current={samples.length} target={20} label="Minimum (basic training)" />
-              <ProgressBar current={samples.length} target={50} label="Recommended (good accuracy)" />
-              <ProgressBar current={samples.length} target={100} label="Ideal (excellent accuracy)" />
+              <ProgressBar current={recordingCount} target={MIN_RECORDINGS} label="Minimum (can train)" />
+              <ProgressBar current={recordingCount} target={RECOMMENDED_RECORDINGS} label="Recommended (good accuracy)" />
+              <ProgressBar current={recordingCount} target={OPTIMAL_RECORDINGS} label="Ideal (excellent accuracy)" />
 
-              {samples.length > 0 && samples.length < 20 && (
-                <p className="text-yellow-300 text-sm mt-3">
-                  ⚠️ Keep recording! You need at least 20 samples for basic training.
-                </p>
+              {recordingCount < MIN_RECORDINGS && (
+                <p className="text-yellow-300 text-sm mt-3">⚠️ Keep recording! You need at least {MIN_RECORDINGS} samples to train.</p>
               )}
-              {samples.length >= 20 && samples.length < 50 && (
-                <p className="text-blue-300 text-sm mt-3">
-                  👍 Good start! More samples will improve accuracy.
-                </p>
+              {recordingCount >= MIN_RECORDINGS && recordingCount < RECOMMENDED_RECORDINGS && (
+                <p className="text-blue-300 text-sm mt-3">👍 Good start! More samples will improve accuracy. Ready to train!</p>
               )}
-              {samples.length >= 50 && (
-                <p className="text-green-300 text-sm mt-3">
-                  ✨ Great! You have enough for a solid model. More variety always helps!
-                </p>
+              {recordingCount >= RECOMMENDED_RECORDINGS && (
+                <p className="text-green-300 text-sm mt-3">✨ Excellent! You have enough for a high-quality model.</p>
+              )}
+
+              {canTrain && (
+                <button
+                  onClick={() => setActiveTab('train')}
+                  className="w-full mt-4 py-3 bg-green-600 hover:bg-green-500 text-white rounded-lg font-semibold transition"
+                >
+                  🧠 Ready to Train → Go to Training
+                </button>
               )}
             </section>
 
             {/* Samples List */}
-            <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-6">
+            <section className="bg-white/10 backdrop-blur rounded-2xl p-6">
               <div className="flex items-center justify-between mb-4">
-                <h2 className="text-xl font-semibold text-white">
-                  Recorded Samples ({samples.length})
-                </h2>
-                <div className="flex gap-2">
-                  {samples.length > 0 && (
-                    <>
-                      <button
-                        onClick={() => {
-                          samples.forEach(s => URL.revokeObjectURL(s.url))
-                          setSamples([])
-                        }}
-                        className="bg-red-600/50 hover:bg-red-600 text-white px-3 py-2 rounded-lg text-sm transition"
-                      >
-                        🗑️ Clear All
-                      </button>
-                      <button
-                        onClick={exportSamples}
-                        className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition"
-                      >
-                        💾 Export ZIP
-                      </button>
-                    </>
-                  )}
-                </div>
+                <h2 className="text-xl font-semibold text-white">Recorded Samples ({recordingCount})</h2>
+                {samples.length > 0 && (
+                  <button
+                    onClick={() => {
+                      samples.forEach(s => URL.revokeObjectURL(s.url))
+                      setSamples([])
+                    }}
+                    className="bg-red-600/50 hover:bg-red-600 text-white px-3 py-2 rounded-lg text-sm transition"
+                  >
+                    🗑️ Clear Local
+                  </button>
+                )}
               </div>
 
               {samples.length === 0 ? (
                 <div className="text-center py-8">
                   <p className="text-purple-300 text-lg">No samples yet</p>
-                  <p className="text-purple-400 text-sm mt-2">
-                    Enter your wake word above and click the record button to start
-                  </p>
+                  <p className="text-purple-400 text-sm mt-2">Enter your wake word above and click the record button to start</p>
                 </div>
               ) : (
                 <div className="space-y-2 max-h-64 overflow-y-auto">
@@ -787,10 +701,12 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
                         <div className="text-white text-sm">{sample.duration.toFixed(1)}s</div>
                         <div className="text-purple-400 text-xs">{sample.timestamp.toLocaleTimeString()}</div>
                       </div>
+                      <span className={`text-xs px-2 py-1 rounded ${sample.uploaded ? 'bg-green-500/20 text-green-300' : 'bg-yellow-500/20 text-yellow-300'}`}>
+                        {sample.uploaded ? '✓ Uploaded' : 'Local only'}
+                      </span>
                       <button
                         onClick={() => deleteSample(sample.id)}
                         className="text-red-400 hover:text-red-300 p-2 opacity-50 hover:opacity-100 transition"
-                        title="Delete sample"
                       >
                         🗑️
                       </button>
@@ -799,168 +715,122 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
                 </div>
               )}
             </section>
+          </>
+        ) : (
+          /* Train Tab */
+          <section className="bg-white/10 backdrop-blur rounded-2xl rounded-tl-none p-6">
+            <h2 className="text-2xl font-bold text-white mb-6">🧠 Train Your Wake Word Model</h2>
 
-            {/* Share Agreement & Upload */}
-            {samples.length >= 5 && API_BASE && (
-              <section className="bg-white/10 backdrop-blur rounded-2xl p-6 mb-6">
-                <h2 className="text-xl font-semibold text-white mb-4">📤 Share with Community</h2>
+            {!trainingJob ? (
+              <>
+                {/* Training options */}
+                <div className="bg-white/5 rounded-lg p-6 mb-6">
+                  <h3 className="text-white font-semibold mb-4">Training Options</h3>
 
-                <div className="bg-purple-900/50 rounded-lg p-4 mb-4">
-                  <label className="flex items-start gap-3 cursor-pointer">
+                  <label className="flex items-start gap-3 cursor-pointer mb-4">
                     <input
                       type="checkbox"
-                      checked={agreedToShare}
-                      onChange={(e) => setAgreedToShare(e.target.checked)}
+                      checked={useSynthetic}
+                      onChange={(e) => setUseSynthetic(e.target.checked)}
                       className="mt-1 w-5 h-5 rounded"
                     />
-                    <div className="text-purple-200 text-sm">
-                      <strong className="text-white">I agree to share these recordings publicly.</strong>
-                      <p className="mt-1">
-                        By uploading, you release these audio samples under the{' '}
-                        <a href="https://creativecommons.org/publicdomain/zero/1.0/" target="_blank" rel="noopener noreferrer" className="text-purple-400 underline">
-                          CC0 Public Domain
-                        </a>{' '}
-                        license. Anyone can use them freely for wake word training.
+                    <div>
+                      <span className="text-white font-medium">Generate synthetic samples</span>
+                      <p className="text-purple-300 text-sm mt-1">
+                        Use AI text-to-speech to generate additional training samples with different voices. Recommended for better accuracy.
                       </p>
                     </div>
                   </label>
+
+                  <div className="p-4 bg-blue-500/20 border border-blue-500/30 rounded-lg">
+                    <p className="text-blue-200 text-sm">
+                      <strong>What happens during training:</strong>
+                      <br />1. Your {recordingCount} recordings are converted to 16kHz WAV
+                      <br />2. {useSynthetic ? 'Synthetic voice samples are generated' : 'No synthetic samples (your recordings only)'}
+                      <br />3. Audio is augmented with speed/volume variations
+                      <br />4. Neural network is trained on the data
+                      <br />5. ONNX model is exported for use
+                    </p>
+                  </div>
                 </div>
 
+                {/* Start training */}
                 <button
-                  onClick={uploadToCommunity}
-                  disabled={!agreedToShare || isUploading}
-                  className={`w-full py-3 rounded-lg font-semibold transition ${
-                    agreedToShare && !isUploading
-                      ? 'bg-green-600 hover:bg-green-500 text-white'
+                  onClick={startTraining}
+                  disabled={!canTrain || isStartingTraining}
+                  className={`w-full py-4 rounded-lg font-bold text-lg transition ${
+                    canTrain && !isStartingTraining
+                      ? 'bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-white'
                       : 'bg-gray-600 text-gray-400 cursor-not-allowed'
                   }`}
                 >
-                  {isUploading ? uploadProgress : '🌐 Upload to Community Library'}
+                  {isStartingTraining ? '⏳ Starting...' : canTrain ? '🚀 Start Training' : `Need ${MIN_RECORDINGS - recordingCount} more recordings`}
                 </button>
-              </section>
-            )}
 
-            {/* Next Steps */}
-            <section className="bg-white/10 backdrop-blur rounded-2xl p-6">
-              <h2 className="text-xl font-semibold text-white mb-4">🚀 After Recording</h2>
-              <div className="space-y-4 text-purple-200">
-                <div className="flex gap-4 p-4 bg-white/5 rounded-lg">
-                  <span className="text-3xl">1️⃣</span>
-                  <div>
-                    <h3 className="text-white font-medium">Export Your Samples</h3>
-                    <p className="text-sm">Click "Export ZIP" to download your recordings with metadata and conversion scripts.</p>
-                  </div>
-                </div>
-                <div className="flex gap-4 p-4 bg-white/5 rounded-lg">
-                  <span className="text-3xl">2️⃣</span>
-                  <div>
-                    <h3 className="text-white font-medium">Convert to WAV</h3>
-                    <p className="text-sm">Run <code className="bg-black/30 px-2 py-1 rounded">./convert_to_wav.sh</code> (requires FFmpeg) to get 16kHz mono WAV files.</p>
-                  </div>
-                </div>
-                <div className="flex gap-4 p-4 bg-white/5 rounded-lg">
-                  <span className="text-3xl">3️⃣</span>
-                  <div>
-                    <h3 className="text-white font-medium">Train Your Model</h3>
-                    <p className="text-sm">
-                      Use the{' '}
-                      <a href="https://github.com/dscripka/openWakeWord" target="_blank" rel="noopener noreferrer" className="text-purple-400 hover:text-purple-300 underline">
-                        OpenWakeWord training notebook
-                      </a>{' '}
-                      to create your custom ONNX model.
-                    </p>
-                  </div>
-                </div>
-                <div className="flex gap-4 p-4 bg-white/5 rounded-lg">
-                  <span className="text-3xl">4️⃣</span>
-                  <div>
-                    <h3 className="text-white font-medium">Use in Your Project</h3>
-                    <p className="text-sm">
-                      Works with Home Assistant, Knowledge Nexus, or any OpenWakeWord-compatible application.
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </section>
-          </>
-        ) : (
-          /* Browse Tab */
-          <section className="bg-white/10 backdrop-blur rounded-2xl rounded-tl-none p-6">
-            {/* Search & Sort */}
-            <div className="flex flex-col sm:flex-row gap-4 mb-6">
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search wake words..."
-                className="flex-1 bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
-              />
-              <select
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value as SortBy)}
-                className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
-              >
-                <option value="weightedRating">Top Rated</option>
-                <option value="sampleCount">Most Samples</option>
-                <option value="createdAt">Newest</option>
-                <option value="name">Alphabetical</option>
-              </select>
-            </div>
-
-            {/* Wakeword List */}
-            {isLoading ? (
-              <div className="text-center py-12 text-purple-300">Loading...</div>
-            ) : communityWakewords.length === 0 ? (
-              <div className="text-center py-12">
-                <p className="text-purple-300 mb-4">
-                  {API_BASE ? 'No wake words yet. Be the first to contribute!' : 'Community library coming soon!'}
-                </p>
-                <button
-                  onClick={() => setActiveTab('record')}
-                  className="bg-purple-600 hover:bg-purple-500 text-white px-6 py-2 rounded-lg transition"
-                >
-                  🎙️ Record a Wake Word
-                </button>
-              </div>
+                {!canTrain && (
+                  <p className="text-center text-yellow-300 mt-4">
+                    You need at least {MIN_RECORDINGS} recordings to train. Go back to Record tab and add more samples.
+                  </p>
+                )}
+              </>
             ) : (
-              <div className="space-y-4">
-                {communityWakewords.map(ww => (
-                  <div key={ww.id} className="bg-white/5 rounded-lg p-4">
-                    <div className="flex items-start justify-between">
-                      <div>
-                        <h3 className="text-white font-semibold text-lg">{ww.displayName}</h3>
-                        {ww.description && (
-                          <p className="text-purple-300 text-sm mt-1">{ww.description}</p>
-                        )}
-                        <div className="flex items-center gap-4 mt-2 text-sm text-purple-400">
-                          <span>📁 {ww.sampleCount} samples</span>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <StarRating
-                          wakewordId={ww.id}
-                          currentRating={ww.averageRating}
-                          userRating={userRatings[ww.id]}
-                          ratingCount={ww.ratingCount}
-                        />
-                        <a
-                          href={`${API_BASE}/wakewords/${ww.id}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-purple-400 hover:text-purple-300 text-sm mt-2 inline-block"
-                        >
-                          Download samples →
-                        </a>
-                      </div>
-                    </div>
+              /* Training progress */
+              <div className="space-y-6">
+                <div className="text-center">
+                  <div className={`text-6xl mb-4 ${trainingJob.status === 'completed' ? '' : 'animate-pulse'}`}>
+                    {trainingJob.status === 'completed' ? '✅' : trainingJob.status === 'failed' ? '❌' : '🔄'}
                   </div>
-                ))}
+                  <h3 className="text-2xl font-bold text-white capitalize">
+                    {trainingJob.status.replace(/_/g, ' ')}
+                  </h3>
+                  <p className="text-purple-300 mt-2">{trainingJob.progress_message}</p>
+                </div>
+
+                {/* Progress bar */}
+                <div className="bg-white/10 rounded-full h-4 overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-500 ${
+                      trainingJob.status === 'failed' ? 'bg-red-500' : 'bg-gradient-to-r from-purple-500 to-green-500'
+                    }`}
+                    style={{ width: `${trainingJob.progress}%` }}
+                  />
+                </div>
+                <p className="text-center text-purple-400">{trainingJob.progress}% complete</p>
+
+                {/* Download button */}
+                {trainingJob.status === 'completed' && (
+                  <div className="text-center">
+                    <button
+                      onClick={downloadModel}
+                      className="px-8 py-4 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-white rounded-lg font-bold text-lg transition transform hover:scale-105"
+                    >
+                      📥 Download {session?.wake_word}.onnx
+                    </button>
+                    <p className="text-purple-300 mt-4 text-sm">
+                      Use this ONNX model with OpenWakeWord, Home Assistant, or Knowledge Nexus.
+                    </p>
+                  </div>
+                )}
+
+                {trainingJob.status === 'failed' && (
+                  <div className="text-center">
+                    <p className="text-red-300 mb-4">Training failed. You can try again with more samples or different options.</p>
+                    <button
+                      onClick={() => setTrainingJob(null)}
+                      className="px-6 py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition"
+                    >
+                      🔄 Try Again
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
-            {/* Rating explanation */}
-            <div className="mt-8 p-4 bg-purple-900/30 rounded-lg text-purple-300 text-sm">
-              <strong className="text-white">How ratings work:</strong> We use a Bayesian weighted algorithm so a single 5-star doesn't outrank 25 reviews at 4.5 stars. More ratings = more accurate scores.
+            {/* Info about sessions */}
+            <div className="mt-8 p-4 bg-yellow-500/20 border border-yellow-500/30 rounded-lg">
+              <p className="text-yellow-200 text-sm">
+                <strong>⏱️ Session Expiry:</strong> All recordings are automatically deleted after 24 hours. Make sure to complete your training and download your model before then!
+              </p>
             </div>
           </section>
         )}
@@ -974,9 +844,9 @@ echo "Total files converted: $(ls -1 wav_output/*.wav 2>/dev/null | wc -l)"
             <a href="https://github.com/dscripka/openWakeWord" target="_blank" rel="noopener noreferrer" className="underline hover:text-purple-300">
               OpenWakeWord
             </a>
-            {' '}• All shared samples are{' '}
-            <a href="https://creativecommons.org/publicdomain/zero/1.0/" target="_blank" rel="noopener noreferrer" className="underline hover:text-purple-300">
-              CC0 Public Domain
+            {' '}•{' '}
+            <a href="https://knowledgenexus.ai" className="underline hover:text-purple-300">
+              Knowledge Nexus
             </a>
             {' '}•{' '}
             <a href="https://jaredcluff.com" className="underline hover:text-purple-300">

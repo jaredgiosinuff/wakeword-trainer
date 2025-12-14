@@ -1,0 +1,488 @@
+"""Wake Word Trainer Backend API.
+
+Provides endpoints for:
+- Session management (create, get, delete)
+- Recording upload and conversion
+- Training job management
+- Model download
+- Automatic 24-hour cleanup
+"""
+
+import asyncio
+import shutil
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+import json
+import uuid
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from config import (
+    RECORDINGS_DIR, MODELS_DIR, DATA_DIR,
+    MAX_RECORDING_AGE_HOURS, CLEANUP_INTERVAL_MINUTES,
+    MIN_RECORDINGS_FOR_TRAINING, RECOMMENDED_RECORDINGS, OPTIMAL_RECORDINGS
+)
+from models import (
+    Session, SessionStatus, Recording,
+    TrainingJob, TrainingStatus,
+    CreateSessionRequest, CreateSessionResponse,
+    SessionInfoResponse, StartTrainingRequest, TrainingStatusResponse
+)
+from audio_processor import convert_webm_to_wav, validate_wav_format
+from training import TrainingPipeline
+
+
+# In-memory storage (use Redis/DB in production)
+sessions: dict[str, Session] = {}
+recordings: dict[str, list[Recording]] = {}  # session_id -> recordings
+training_jobs: dict[str, TrainingJob] = {}  # job_id -> job
+
+# Scheduler for cleanup
+scheduler = AsyncIOScheduler()
+
+
+async def cleanup_old_recordings():
+    """Remove recordings older than 24 hours."""
+    print(f"[{datetime.utcnow()}] Running cleanup job...")
+    cutoff = datetime.utcnow() - timedelta(hours=MAX_RECORDING_AGE_HOURS)
+    sessions_to_remove = []
+
+    for session_id, session in sessions.items():
+        if session.created_at < cutoff:
+            sessions_to_remove.append(session_id)
+
+    for session_id in sessions_to_remove:
+        # Remove recordings from disk
+        session_dir = RECORDINGS_DIR / session_id
+        if session_dir.exists():
+            shutil.rmtree(session_dir)
+            print(f"  Removed session directory: {session_dir}")
+
+        # Remove from memory
+        sessions.pop(session_id, None)
+        recordings.pop(session_id, None)
+
+        # Remove associated training jobs
+        jobs_to_remove = [
+            job_id for job_id, job in training_jobs.items()
+            if job.session_id == session_id
+        ]
+        for job_id in jobs_to_remove:
+            job = training_jobs.pop(job_id, None)
+            if job and job.model_path:
+                model_path = Path(job.model_path)
+                if model_path.exists():
+                    model_path.unlink()
+                    print(f"  Removed model: {model_path}")
+
+    print(f"  Cleaned up {len(sessions_to_remove)} expired sessions")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events."""
+    # Start cleanup scheduler
+    scheduler.add_job(
+        cleanup_old_recordings,
+        'interval',
+        minutes=CLEANUP_INTERVAL_MINUTES,
+        id='cleanup_job'
+    )
+    scheduler.start()
+    print(f"Cleanup scheduler started (every {CLEANUP_INTERVAL_MINUTES} minutes)")
+
+    yield
+
+    # Shutdown
+    scheduler.shutdown()
+    print("Cleanup scheduler stopped")
+
+
+app = FastAPI(
+    title="Wake Word Trainer API",
+    description="Backend for recording, converting, and training custom wake words",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================================
+# Session Endpoints
+# ============================================================================
+
+@app.post("/api/sessions", response_model=CreateSessionResponse)
+async def create_session(request: CreateSessionRequest):
+    """Create a new recording session for a wake word."""
+    session = Session(wake_word=request.wake_word.strip().lower())
+    sessions[session.id] = session
+    recordings[session.id] = []
+
+    # Create session directory
+    session_dir = RECORDINGS_DIR / session.id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    return CreateSessionResponse(
+        session_id=session.id,
+        wake_word=session.wake_word,
+        message=f"Session created. Record at least {MIN_RECORDINGS_FOR_TRAINING} samples "
+                f"({RECOMMENDED_RECORDINGS} recommended, {OPTIMAL_RECORDINGS} optimal)."
+    )
+
+
+@app.get("/api/sessions/{session_id}", response_model=SessionInfoResponse)
+async def get_session(session_id: str):
+    """Get session info including recordings and training readiness."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    session_recordings = recordings.get(session_id, [])
+
+    recording_count = len(session_recordings)
+    can_train = recording_count >= MIN_RECORDINGS_FOR_TRAINING
+    recommended_more = max(0, RECOMMENDED_RECORDINGS - recording_count)
+
+    session.recording_count = recording_count
+
+    return SessionInfoResponse(
+        session=session,
+        recordings=session_recordings,
+        can_train=can_train,
+        recommended_more=recommended_more
+    )
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session and all its recordings."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Remove recordings from disk
+    session_dir = RECORDINGS_DIR / session_id
+    if session_dir.exists():
+        shutil.rmtree(session_dir)
+
+    # Remove from memory
+    sessions.pop(session_id, None)
+    recordings.pop(session_id, None)
+
+    return {"message": "Session deleted"}
+
+
+# ============================================================================
+# Recording Endpoints
+# ============================================================================
+
+@app.post("/api/sessions/{session_id}/recordings")
+async def upload_recording(
+    session_id: str,
+    file: UploadFile = File(...)
+):
+    """Upload a recording for a session.
+
+    Accepts WebM, OGG, MP3, or WAV files.
+    Automatically converts to 16kHz mono WAV.
+    """
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    session_dir = RECORDINGS_DIR / session_id
+
+    # Validate file type
+    allowed_types = [
+        'audio/webm', 'audio/ogg', 'audio/mpeg', 'audio/mp3',
+        'audio/wav', 'audio/x-wav', 'audio/wave'
+    ]
+    content_type = file.content_type or ''
+    if not any(t in content_type for t in ['audio', 'webm', 'ogg', 'mpeg', 'wav']):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: {content_type}. Allowed: audio files"
+        )
+
+    # Save uploaded file
+    recording_id = str(uuid.uuid4())
+    ext = Path(file.filename or 'recording.webm').suffix or '.webm'
+    original_path = session_dir / f"{recording_id}{ext}"
+
+    content = await file.read()
+    original_path.write_bytes(content)
+
+    # Convert to WAV
+    wav_path = session_dir / f"{recording_id}.wav"
+    conversion_success = convert_webm_to_wav(original_path, wav_path)
+
+    if not conversion_success:
+        original_path.unlink()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to convert audio to WAV format"
+        )
+
+    # Validate WAV format
+    validation = validate_wav_format(wav_path)
+    if not validation["valid"]:
+        wav_path.unlink()
+        original_path.unlink()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio validation failed: {validation['errors']}"
+        )
+
+    # Remove original, keep WAV
+    if original_path.exists() and original_path != wav_path:
+        original_path.unlink()
+
+    # Create recording entry
+    recording = Recording(
+        id=recording_id,
+        session_id=session_id,
+        filename=f"{recording_id}.wav",
+        converted=True,
+        wav_path=str(wav_path),
+        duration_seconds=validation.get("duration", 3.0)
+    )
+
+    recordings.setdefault(session_id, []).append(recording)
+    session.updated_at = datetime.utcnow()
+    session.recording_count = len(recordings[session_id])
+
+    return {
+        "recording_id": recording.id,
+        "message": "Recording uploaded and converted",
+        "duration": recording.duration_seconds,
+        "total_recordings": session.recording_count,
+        "can_train": session.recording_count >= MIN_RECORDINGS_FOR_TRAINING
+    }
+
+
+@app.delete("/api/sessions/{session_id}/recordings/{recording_id}")
+async def delete_recording(session_id: str, recording_id: str):
+    """Delete a specific recording."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_recordings = recordings.get(session_id, [])
+    recording = next((r for r in session_recordings if r.id == recording_id), None)
+
+    if not recording:
+        raise HTTPException(status_code=404, detail="Recording not found")
+
+    # Remove file
+    if recording.wav_path:
+        wav_path = Path(recording.wav_path)
+        if wav_path.exists():
+            wav_path.unlink()
+
+    # Remove from list
+    recordings[session_id] = [r for r in session_recordings if r.id != recording_id]
+    sessions[session_id].recording_count = len(recordings[session_id])
+
+    return {"message": "Recording deleted"}
+
+
+# ============================================================================
+# Training Endpoints
+# ============================================================================
+
+@app.post("/api/sessions/{session_id}/train", response_model=TrainingStatusResponse)
+async def start_training(
+    session_id: str,
+    request: StartTrainingRequest,
+    background_tasks: BackgroundTasks
+):
+    """Start training a wake word model.
+
+    Requires at least MIN_RECORDINGS_FOR_TRAINING recordings.
+    Training runs in the background.
+    """
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    session_recordings = recordings.get(session_id, [])
+
+    if len(session_recordings) < MIN_RECORDINGS_FOR_TRAINING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Need at least {MIN_RECORDINGS_FOR_TRAINING} recordings, "
+                   f"got {len(session_recordings)}"
+        )
+
+    # Check if already training
+    if session.training_job_id:
+        existing_job = training_jobs.get(session.training_job_id)
+        if existing_job and existing_job.status in [
+            TrainingStatus.QUEUED,
+            TrainingStatus.GENERATING_SYNTHETIC,
+            TrainingStatus.AUGMENTING,
+            TrainingStatus.TRAINING,
+            TrainingStatus.EXPORTING
+        ]:
+            raise HTTPException(
+                status_code=409,
+                detail="Training already in progress"
+            )
+
+    # Create training job
+    job = TrainingJob(
+        session_id=session_id,
+        wake_word=session.wake_word,
+        use_synthetic=request.use_synthetic,
+        synthetic_voices=request.synthetic_voices,
+        augmentation_factor=request.augmentation_factor
+    )
+    training_jobs[job.id] = job
+    session.training_job_id = job.id
+    session.status = SessionStatus.TRAINING
+
+    # Start training in background
+    background_tasks.add_task(run_training, job.id)
+
+    return TrainingStatusResponse(
+        job=job,
+        download_ready=False
+    )
+
+
+async def run_training(job_id: str):
+    """Background task to run training pipeline."""
+    job = training_jobs.get(job_id)
+    if not job:
+        return
+
+    job.started_at = datetime.utcnow()
+    job.status = TrainingStatus.GENERATING_SYNTHETIC
+
+    def progress_callback(percent: int, message: str):
+        job.progress = max(0, percent)
+        job.progress_message = message
+        if percent < 0:
+            job.status = TrainingStatus.FAILED
+        elif percent >= 100:
+            job.status = TrainingStatus.COMPLETED
+
+    try:
+        pipeline = TrainingPipeline(
+            job=job,
+            recordings_dir=RECORDINGS_DIR
+        )
+
+        model_path = await pipeline.run(progress_callback)
+
+        if model_path and model_path.exists():
+            job.model_path = str(model_path)
+            job.status = TrainingStatus.COMPLETED
+            job.completed_at = datetime.utcnow()
+            job.progress = 100
+            job.progress_message = "Training complete! Model ready for download."
+
+            # Update session
+            if job.session_id in sessions:
+                sessions[job.session_id].status = SessionStatus.COMPLETED
+        else:
+            job.status = TrainingStatus.FAILED
+            job.error_message = "Training completed but no model produced"
+
+    except Exception as e:
+        job.status = TrainingStatus.FAILED
+        job.error_message = str(e)
+        job.completed_at = datetime.utcnow()
+
+        if job.session_id in sessions:
+            sessions[job.session_id].status = SessionStatus.FAILED
+
+
+@app.get("/api/training/{job_id}", response_model=TrainingStatusResponse)
+async def get_training_status(job_id: str):
+    """Get the status of a training job."""
+    if job_id not in training_jobs:
+        raise HTTPException(status_code=404, detail="Training job not found")
+
+    job = training_jobs[job_id]
+    download_ready = (
+        job.status == TrainingStatus.COMPLETED and
+        job.model_path and
+        Path(job.model_path).exists()
+    )
+
+    return TrainingStatusResponse(
+        job=job,
+        download_ready=download_ready
+    )
+
+
+@app.get("/api/training/{job_id}/download")
+async def download_model(job_id: str):
+    """Download the trained ONNX model."""
+    if job_id not in training_jobs:
+        raise HTTPException(status_code=404, detail="Training job not found")
+
+    job = training_jobs[job_id]
+
+    if job.status != TrainingStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Training not complete. Status: {job.status}"
+        )
+
+    if not job.model_path or not Path(job.model_path).exists():
+        raise HTTPException(status_code=404, detail="Model file not found")
+
+    return FileResponse(
+        job.model_path,
+        media_type="application/octet-stream",
+        filename=f"{job.wake_word}.onnx"
+    )
+
+
+# ============================================================================
+# Health & Info Endpoints
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "active_sessions": len(sessions),
+        "active_training_jobs": len([
+            j for j in training_jobs.values()
+            if j.status in [TrainingStatus.QUEUED, TrainingStatus.TRAINING]
+        ])
+    }
+
+
+@app.get("/api/info")
+async def get_info():
+    """Get API configuration info."""
+    return {
+        "min_recordings": MIN_RECORDINGS_FOR_TRAINING,
+        "recommended_recordings": RECOMMENDED_RECORDINGS,
+        "optimal_recordings": OPTIMAL_RECORDINGS,
+        "max_recording_age_hours": MAX_RECORDING_AGE_HOURS,
+        "supported_formats": ["webm", "ogg", "mp3", "wav"],
+        "output_format": "onnx"
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8400, reload=True)
