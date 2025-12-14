@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Wake Word Trainer Backend API
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: nodejs18.x
+    Environment:
+      Variables:
+        WAKEWORDS_TABLE: !Ref WakewordsTable
+        SAMPLES_BUCKET: !Ref SamplesBucket
+        RATINGS_TABLE: !Ref RatingsTable
+
+Resources:
+  # DynamoDB Tables
+  WakewordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: wakeword-trainer-wakewords
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: name
+          AttributeType: S
+        - AttributeName: weightedRating
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: name-index
+          KeySchema:
+            - AttributeName: name
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: rating-index
+          KeySchema:
+            - AttributeName: name
+              KeyType: HASH
+            - AttributeName: weightedRating
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  RatingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: wakeword-trainer-ratings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: wakewordId
+          AttributeType: S
+        - AttributeName: visitorId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: wakewordId
+          KeyType: HASH
+        - AttributeName: visitorId
+          KeyType: RANGE
+
+  # S3 Bucket for audio samples
+  SamplesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: wakeword-trainer-samples
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+
+  # API Gateway
+  WakewordApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  # Lambda Functions
+  ListWakewordsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/
+      Handler: wakewords.list
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref WakewordsTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WakewordApi
+            Path: /wakewords
+            Method: GET
+
+  GetWakewordFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/
+      Handler: wakewords.get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref WakewordsTable
+        - S3ReadPolicy:
+            BucketName: !Ref SamplesBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WakewordApi
+            Path: /wakewords/{id}
+            Method: GET
+
+  CreateWakewordFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/
+      Handler: wakewords.create
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WakewordsTable
+        - S3CrudPolicy:
+            BucketName: !Ref SamplesBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WakewordApi
+            Path: /wakewords
+            Method: POST
+
+  UploadSampleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/
+      Handler: samples.upload
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WakewordsTable
+        - S3CrudPolicy:
+            BucketName: !Ref SamplesBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WakewordApi
+            Path: /wakewords/{id}/samples
+            Method: POST
+
+  RateWakewordFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/
+      Handler: ratings.rate
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WakewordsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RatingsTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WakewordApi
+            Path: /wakewords/{id}/rate
+            Method: POST
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway URL
+    Value: !Sub 'https://${WakewordApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  SamplesBucket:
+    Description: S3 bucket for audio samples
+    Value: !Ref SamplesBucket
