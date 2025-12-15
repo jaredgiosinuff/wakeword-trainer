@@ -1,14 +1,26 @@
-"""OpenWakeWord training pipeline integration."""
+"""OpenWakeWord training pipeline with streaming embeddings.
+
+This module trains wake word models that work correctly with OpenWakeWord's
+streaming inference. The key insight is that training must use the same
+embedding extraction method as inference (streaming chunks, not batch).
+"""
 
 import asyncio
+import copy
 import shutil
 import subprocess
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 import json
 import os
+
+import numpy as np
+import onnx
+import scipy.io.wavfile as wav
+import scipy.signal
+import torch
+from torch import nn, optim
 
 from config import (
     MODELS_DIR, TEMP_DIR, RECORDINGS_DIR,
@@ -18,8 +30,45 @@ from models import TrainingJob, TrainingStatus
 from audio_processor import augment_audio, validate_wav_format
 
 
+# OpenWakeWord model constants
+SAMPLE_RATE = 16000
+CLIP_DURATION_SAMPLES = 32000  # 2 seconds
+INPUT_SHAPE = (16, 96)  # OpenWakeWord model input shape
+CHUNK_SIZE = 1280  # 80ms at 16kHz - same as streaming inference
+
+
+class WakeWordDNN(nn.Module):
+    """Simple DNN model matching OpenWakeWord architecture."""
+
+    def __init__(self, input_shape=INPUT_SHAPE, layer_dim=32, n_blocks=1):
+        super().__init__()
+        self.input_shape = input_shape
+
+        self.flatten = nn.Flatten()
+        self.layer1 = nn.Linear(input_shape[0] * input_shape[1], layer_dim)
+        self.relu1 = nn.ReLU()
+        self.layernorm1 = nn.LayerNorm(layer_dim)
+
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(layer_dim, layer_dim),
+                nn.ReLU(),
+                nn.LayerNorm(layer_dim)
+            ) for _ in range(n_blocks)
+        ])
+
+        self.output = nn.Linear(layer_dim, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.relu1(self.layernorm1(self.layer1(self.flatten(x))))
+        for block in self.blocks:
+            x = block(x)
+        return self.sigmoid(self.output(x))
+
+
 class TrainingPipeline:
-    """Handles the full OpenWakeWord training pipeline."""
+    """Handles the full OpenWakeWord training pipeline with streaming embeddings."""
 
     def __init__(self, job: TrainingJob, recordings_dir: Path):
         self.job = job
@@ -29,13 +78,21 @@ class TrainingPipeline:
 
         # Sub-directories
         self.positive_dir = self.work_dir / "positive"
-        self.negative_dir = self.work_dir / "negative"
         self.augmented_dir = self.work_dir / "augmented"
-        self.synthetic_dir = self.work_dir / "synthetic"
 
-        for d in [self.positive_dir, self.negative_dir,
-                  self.augmented_dir, self.synthetic_dir]:
+        for d in [self.positive_dir, self.augmented_dir]:
             d.mkdir(exist_ok=True)
+
+        # Feature extractor (initialized lazily)
+        self._feature_extractor = None
+
+    @property
+    def feature_extractor(self):
+        """Lazily initialize the OpenWakeWord feature extractor."""
+        if self._feature_extractor is None:
+            from openwakeword.utils import AudioFeatures
+            self._feature_extractor = AudioFeatures(inference_framework='onnx')
+        return self._feature_extractor
 
     async def run(
         self,
@@ -57,39 +114,54 @@ class TrainingPipeline:
             if len(wav_files) < 5:
                 raise ValueError(f"Need at least 5 recordings, got {len(wav_files)}")
 
+            print(f"[Training] Collected {len(wav_files)} recordings")
+
             # Step 2: Generate synthetic samples (optional)
             if self.job.use_synthetic:
                 await self._update_progress(
-                    progress_callback, 15,
+                    progress_callback, 10,
                     "Generating synthetic voice samples..."
                 )
                 synthetic_files = await self._generate_synthetic_samples()
                 wav_files.extend(synthetic_files)
+                print(f"[Training] Added {len(synthetic_files)} synthetic samples")
 
-            # Step 3: Augment audio
-            await self._update_progress(progress_callback, 35, "Augmenting audio samples...")
+            # Step 3: Augment audio using existing audio_processor
+            await self._update_progress(progress_callback, 20, "Augmenting audio samples...")
             augmented_files = await self._augment_samples(wav_files)
-            all_positive = wav_files + augmented_files
+            all_positive_files = wav_files + augmented_files
+            print(f"[Training] Total positive samples: {len(all_positive_files)}")
 
-            # Step 4: Generate/collect negative samples
+            # Step 4: Load audio and compute streaming embeddings
             await self._update_progress(
-                progress_callback, 50,
-                "Preparing negative samples..."
+                progress_callback, 35,
+                "Computing audio embeddings (streaming mode)..."
             )
-            await self._prepare_negative_samples()
+            positive_audio = self._load_audio_files(all_positive_files)
+            positive_embeddings = self._compute_streaming_embeddings(positive_audio)
+            print(f"[Training] Positive embeddings shape: {positive_embeddings.shape}")
 
-            # Step 5: Train the model
-            await self._update_progress(progress_callback, 60, "Training model...")
-            model_path = await self._train_model(all_positive)
+            # Step 5: Generate negative embeddings
+            await self._update_progress(progress_callback, 50, "Generating negative samples...")
+            negative_embeddings = self._generate_negative_embeddings(
+                n_samples=len(positive_embeddings) * 10
+            )
+            print(f"[Training] Negative embeddings shape: {negative_embeddings.shape}")
 
-            # Step 6: Export to ONNX
+            # Step 6: Train the model
+            await self._update_progress(progress_callback, 60, "Training neural network...")
+            model = await self._train_model(positive_embeddings, negative_embeddings)
+
+            # Step 7: Export to ONNX
             await self._update_progress(progress_callback, 90, "Exporting ONNX model...")
-            onnx_path = await self._export_onnx(model_path)
+            onnx_path = self._export_to_onnx(model)
 
             await self._update_progress(progress_callback, 100, "Training complete!")
             return onnx_path
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             await self._update_progress(
                 progress_callback, -1,
                 f"Training failed: {str(e)}"
@@ -107,6 +179,7 @@ class TrainingPipeline:
         message: str
     ):
         """Update progress through callback."""
+        print(f"[Training {percent}%] {message}")
         if callback:
             callback(percent, message)
         await asyncio.sleep(0)  # Yield to event loop
@@ -117,6 +190,7 @@ class TrainingPipeline:
 
         session_dir = self.recordings_dir / self.job.session_id
         if not session_dir.exists():
+            print(f"[Training] Session directory not found: {session_dir}")
             return wav_files
 
         for recording_file in session_dir.iterdir():
@@ -153,18 +227,17 @@ class TrainingPipeline:
             )
 
             if piper_check.returncode != 0:
-                print("Piper TTS not available, skipping synthetic generation")
+                print("[Training] Piper TTS not available, skipping synthetic generation")
                 return synthetic_files
 
             # Generate samples with different voices
             voice_models = self._get_available_piper_voices()
+            synthetic_dir = self.work_dir / "synthetic"
+            synthetic_dir.mkdir(exist_ok=True)
 
             for voice_idx, voice_model in enumerate(voice_models[:self.job.synthetic_voices]):
                 for sample_idx in range(SYNTHETIC_SAMPLES_PER_VOICE):
-                    output_path = self.synthetic_dir / f"synthetic_{voice_idx}_{sample_idx}.wav"
-
-                    # Vary the text slightly for natural variation
-                    text = self._get_wake_word_variation(wake_word, sample_idx)
+                    output_path = synthetic_dir / f"synthetic_{voice_idx}_{sample_idx}.wav"
 
                     cmd = [
                         "piper",
@@ -179,11 +252,11 @@ class TrainingPipeline:
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE
                         )
-                        proc.communicate(input=text.encode(), timeout=30)
+                        proc.communicate(input=wake_word.encode(), timeout=30)
 
                         if output_path.exists():
                             # Ensure correct format
-                            final_path = self.synthetic_dir / f"synth_{voice_idx}_{sample_idx}_16k.wav"
+                            final_path = synthetic_dir / f"synth_{voice_idx}_{sample_idx}_16k.wav"
                             resample_cmd = [
                                 "ffmpeg", "-y",
                                 "-i", str(output_path),
@@ -195,20 +268,19 @@ class TrainingPipeline:
 
                             if final_path.exists():
                                 synthetic_files.append(final_path)
-                                output_path.unlink()  # Remove original
+                                output_path.unlink()
 
                     except Exception as e:
-                        print(f"Synthetic generation error: {e}")
+                        print(f"[Training] Synthetic generation error: {e}")
                         continue
 
         except Exception as e:
-            print(f"Piper not available or error: {e}")
+            print(f"[Training] Piper not available or error: {e}")
 
         return synthetic_files
 
     def _get_available_piper_voices(self) -> list[str]:
         """Get list of available Piper voice models."""
-        # Default voices to try - these are common English voices
         default_voices = [
             "en_US-lessac-medium",
             "en_US-libritts-high",
@@ -218,7 +290,6 @@ class TrainingPipeline:
             "en_GB-cori-medium",
         ]
 
-        # Check which are actually available
         available = []
         piper_models_dir = Path.home() / ".local" / "share" / "piper" / "models"
 
@@ -227,13 +298,7 @@ class TrainingPipeline:
                 if model_dir.is_dir():
                     available.append(model_dir.name)
 
-        # Return available or defaults
         return available if available else default_voices
-
-    def _get_wake_word_variation(self, wake_word: str, index: int) -> str:
-        """Get slight variations of wake word for natural TTS."""
-        # Just return the wake word - TTS will handle natural variation
-        return wake_word
 
     async def _augment_samples(self, wav_files: list[Path]) -> list[Path]:
         """Augment audio samples for training diversity."""
@@ -249,201 +314,280 @@ class TrainingPipeline:
 
         return augmented
 
-    async def _prepare_negative_samples(self):
-        """Prepare negative samples for training.
+    def _load_audio_files(self, wav_files: list[Path]) -> list[np.ndarray]:
+        """Load audio files and normalize to 16kHz int16."""
+        audio_clips = []
 
-        Uses background noise, speech from other words, etc.
+        for wav_file in wav_files:
+            try:
+                sr, audio = wav.read(str(wav_file))
+
+                # Convert to mono if stereo
+                if len(audio.shape) > 1:
+                    audio = audio.mean(axis=1)
+
+                # Resample if needed
+                if sr != SAMPLE_RATE:
+                    num_samples = int(len(audio) * SAMPLE_RATE / sr)
+                    audio = scipy.signal.resample(audio, num_samples)
+
+                # Normalize to int16
+                if audio.dtype != np.int16:
+                    if audio.dtype == np.float32 or audio.dtype == np.float64:
+                        audio = (audio * 32767).astype(np.int16)
+                    else:
+                        audio = audio.astype(np.int16)
+
+                audio_clips.append(audio)
+
+            except Exception as e:
+                print(f"[Training] Failed to load {wav_file}: {e}")
+
+        return audio_clips
+
+    def _pad_or_trim(self, audio: np.ndarray, target_length: int) -> np.ndarray:
+        """Pad or trim audio to target length."""
+        if len(audio) < target_length:
+            padding = target_length - len(audio)
+            audio = np.pad(audio, (0, padding), mode='constant')
+        elif len(audio) > target_length:
+            audio = audio[:target_length]
+        return audio
+
+    def _compute_streaming_embeddings(self, audio_clips: list[np.ndarray]) -> np.ndarray:
+        """Compute embeddings using streaming method (matches inference).
+
+        This is the CRITICAL function - it processes audio exactly like
+        OpenWakeWord's streaming inference does, ensuring the model
+        works correctly when deployed.
         """
-        # For now, we'll rely on OpenWakeWord's built-in negative sampling
-        # which uses public domain audio datasets
-        pass
+        all_embeddings = []
 
-    async def _train_model(self, positive_samples: list[Path]) -> Path:
-        """Train the OpenWakeWord model.
+        for clip in audio_clips:
+            clip = self._pad_or_trim(clip, CLIP_DURATION_SAMPLES).astype(np.int16)
 
-        This uses the openwakeword training utilities.
+            # Reset feature extractor for each clip
+            self.feature_extractor.reset()
+
+            # Process clip in chunks just like streaming does
+            for i in range(0, len(clip), CHUNK_SIZE):
+                chunk = clip[i:i+CHUNK_SIZE]
+                if len(chunk) < CHUNK_SIZE:
+                    chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
+                self.feature_extractor(chunk)
+
+            # Get the last 16 frames of embeddings (what the model sees during inference)
+            if self.feature_extractor.feature_buffer.shape[0] >= 16:
+                embedding = self.feature_extractor.feature_buffer[-16:].copy()
+                all_embeddings.append(embedding)
+
+        if all_embeddings:
+            return np.array(all_embeddings)
+        return np.array([])
+
+    def _generate_negative_embeddings(self, n_samples: int = 5000) -> np.ndarray:
+        """Generate negative embeddings from various sources.
+
+        Creates embeddings from:
+        - Silence (various levels)
+        - Random noise
+        - Tone sweeps
+        - Random speech-like patterns
         """
-        # Create training config
-        config = {
-            "wake_word": self.job.wake_word,
-            "positive_samples": [str(p) for p in positive_samples],
-            "output_dir": str(self.work_dir / "model"),
-            "epochs": 100,
-            "batch_size": 32,
-        }
+        all_embeddings = []
 
-        config_path = self.work_dir / "training_config.json"
-        with open(config_path, "w") as f:
-            json.dump(config, f)
+        # Generate different types of negative samples
+        samples_per_type = n_samples // 4
 
-        # Create training script that uses openwakeword's training
-        training_script = self.work_dir / "train.py"
-        training_script.write_text(self._get_training_script())
+        # Type 1: Silence with slight noise
+        for _ in range(samples_per_type):
+            noise_level = np.random.uniform(0, 500)
+            audio = np.random.uniform(-noise_level, noise_level, CLIP_DURATION_SAMPLES).astype(np.int16)
+            self.feature_extractor.reset()
+            for i in range(0, len(audio), CHUNK_SIZE):
+                chunk = audio[i:i+CHUNK_SIZE]
+                if len(chunk) < CHUNK_SIZE:
+                    chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
+                self.feature_extractor(chunk)
+            if self.feature_extractor.feature_buffer.shape[0] >= 16:
+                all_embeddings.append(self.feature_extractor.feature_buffer[-16:].copy())
 
-        # Run training
-        model_output = self.work_dir / "model"
-        model_output.mkdir(exist_ok=True)
+        # Type 2: Random noise at various levels
+        for _ in range(samples_per_type):
+            noise_level = np.random.uniform(1000, 15000)
+            audio = np.random.uniform(-noise_level, noise_level, CLIP_DURATION_SAMPLES).astype(np.int16)
+            self.feature_extractor.reset()
+            for i in range(0, len(audio), CHUNK_SIZE):
+                chunk = audio[i:i+CHUNK_SIZE]
+                if len(chunk) < CHUNK_SIZE:
+                    chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
+                self.feature_extractor(chunk)
+            if self.feature_extractor.feature_buffer.shape[0] >= 16:
+                all_embeddings.append(self.feature_extractor.feature_buffer[-16:].copy())
 
-        try:
-            result = subprocess.run(
-                ["python3", str(training_script), str(config_path)],
-                capture_output=True,
-                text=True,
-                timeout=3600,  # 1 hour timeout
-                cwd=str(self.work_dir)
-            )
+        # Type 3: Tone sweeps (simulate non-speech audio)
+        for _ in range(samples_per_type):
+            t = np.linspace(0, 2, CLIP_DURATION_SAMPLES)
+            freq_start = np.random.uniform(100, 500)
+            freq_end = np.random.uniform(500, 2000)
+            freq = np.linspace(freq_start, freq_end, CLIP_DURATION_SAMPLES)
+            amplitude = np.random.uniform(5000, 20000)
+            audio = (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.int16)
+            self.feature_extractor.reset()
+            for i in range(0, len(audio), CHUNK_SIZE):
+                chunk = audio[i:i+CHUNK_SIZE]
+                if len(chunk) < CHUNK_SIZE:
+                    chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
+                self.feature_extractor(chunk)
+            if self.feature_extractor.feature_buffer.shape[0] >= 16:
+                all_embeddings.append(self.feature_extractor.feature_buffer[-16:].copy())
 
-            if result.returncode != 0:
-                print(f"Training stderr: {result.stderr}")
-                # Fall back to simple model creation
-                return await self._create_simple_model(positive_samples)
+        # Type 4: Filtered noise (simulate speech-like audio without actual words)
+        for _ in range(samples_per_type):
+            audio = np.random.randn(CLIP_DURATION_SAMPLES) * 10000
+            # Apply bandpass filter (300-3400 Hz, speech frequency range)
+            sos = scipy.signal.butter(4, [300, 3400], btype='bandpass', fs=SAMPLE_RATE, output='sos')
+            audio = scipy.signal.sosfilt(sos, audio).astype(np.int16)
+            self.feature_extractor.reset()
+            for i in range(0, len(audio), CHUNK_SIZE):
+                chunk = audio[i:i+CHUNK_SIZE]
+                if len(chunk) < CHUNK_SIZE:
+                    chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
+                self.feature_extractor(chunk)
+            if self.feature_extractor.feature_buffer.shape[0] >= 16:
+                all_embeddings.append(self.feature_extractor.feature_buffer[-16:].copy())
 
-            # Find the trained model
-            for model_file in model_output.iterdir():
-                if model_file.suffix in ['.pt', '.pth', '.onnx']:
-                    return model_file
+        return np.array(all_embeddings)
 
-        except subprocess.TimeoutExpired:
-            print("Training timed out, creating simple model")
+    async def _train_model(
+        self,
+        positive_embeddings: np.ndarray,
+        negative_embeddings: np.ndarray,
+        steps: int = 5000
+    ) -> WakeWordDNN:
+        """Train the wake word model using PyTorch."""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"[Training] Training on device: {device}")
 
-        return await self._create_simple_model(positive_samples)
+        model = WakeWordDNN(input_shape=INPUT_SHAPE, layer_dim=32).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.BCELoss(reduction='none')
 
-    async def _create_simple_model(self, positive_samples: list[Path]) -> Path:
-        """Create a simple model when full training isn't available.
+        # Convert to tensors
+        X_pos = torch.from_numpy(positive_embeddings).float()
+        X_neg = torch.from_numpy(negative_embeddings).float()
 
-        This creates a basic OpenWakeWord-compatible ONNX model.
-        """
-        # Create a minimal ONNX model structure
-        # This is a fallback - real training should use the full pipeline
-        model_path = self.work_dir / "model" / f"{self.job.wake_word}.onnx"
+        # Split for validation
+        n_val = min(len(positive_embeddings) // 5, 100)
+        val_positive = X_pos[-n_val:]
+        train_positive = X_pos[:-n_val] if n_val > 0 else X_pos
 
-        # For now, create a placeholder that indicates training was attempted
-        # In production, this would use the actual openwakeword training
-        script = f'''
-import numpy as np
-import onnx
-from onnx import helper, TensorProto
+        n_val_neg = min(len(negative_embeddings) // 5, 500)
+        val_negative = X_neg[-n_val_neg:]
+        train_negative = X_neg[:-n_val_neg] if n_val_neg > 0 else X_neg
 
-# Create a minimal model structure compatible with OpenWakeWord
-# Input: melspectrogram features (batch, time, features)
-X = helper.make_tensor_value_info('input', TensorProto.FLOAT, [None, 76, 32])
+        best_model = None
+        best_f1 = 0.0
 
-# Output: wake word probability
-Y = helper.make_tensor_value_info('{self.job.wake_word}', TensorProto.FLOAT, [None, 1])
+        for step in range(steps):
+            model.train()
 
-# Simple linear layer weights (placeholder)
-W = helper.make_tensor('W', TensorProto.FLOAT, [2432, 1], np.random.randn(2432).astype(np.float32).tolist())
-B = helper.make_tensor('B', TensorProto.FLOAT, [1], [0.0])
+            # Sample batch
+            batch_size = 64
+            pos_count = min(batch_size // 2, len(train_positive))
+            neg_count = batch_size // 2
 
-# Flatten -> MatMul -> Sigmoid
-flatten = helper.make_node('Flatten', ['input'], ['flat'], axis=1)
-matmul = helper.make_node('MatMul', ['flat', 'W'], ['pre_bias'])
-add = helper.make_node('Add', ['pre_bias', 'B'], ['logits'])
-sigmoid = helper.make_node('Sigmoid', ['logits'], ['{self.job.wake_word}'])
+            pos_indices = np.random.choice(len(train_positive), pos_count, replace=True)
+            neg_indices = np.random.choice(len(train_negative), neg_count, replace=False)
 
-graph = helper.make_graph(
-    [flatten, matmul, add, sigmoid],
-    '{self.job.wake_word}_model',
-    [X],
-    [Y],
-    [W, B]
-)
+            X_batch = torch.cat([train_positive[pos_indices], train_negative[neg_indices]]).to(device)
+            y_batch = torch.cat([
+                torch.ones(pos_count),
+                torch.zeros(neg_count)
+            ]).to(device).unsqueeze(1)
 
-model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 11)])  # Use opset 11 for broad compatibility
-model.producer_name = 'wakeword-trainer'
+            # Forward pass
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
 
-onnx.save(model, '{model_path}')
-print(f"Model saved to {model_path}")
-'''
-        script_path = self.work_dir / "create_model.py"
-        script_path.write_text(script)
+            # Apply class weighting (weight negatives higher to reduce false positives)
+            weight = torch.where(y_batch == 0, torch.tensor(2.0).to(device), torch.tensor(1.0).to(device))
+            loss = (loss * weight).mean()
 
-        try:
-            result = subprocess.run(
-                ["python3", str(script_path)],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            if result.returncode == 0 and model_path.exists():
-                return model_path
-        except Exception as e:
-            print(f"Model creation error: {e}")
+            # Backward pass
+            loss.backward()
+            optimizer.step()
 
-        raise RuntimeError("Failed to create model")
+            # Validation every 500 steps
+            if step % 500 == 0:
+                model.eval()
+                with torch.no_grad():
+                    val_X = torch.cat([val_positive, val_negative]).to(device)
+                    val_y = np.concatenate([np.ones(len(val_positive)), np.zeros(len(val_negative))])
 
-    def _get_training_script(self) -> str:
-        """Get the Python training script content."""
-        return '''
-import sys
-import json
-from pathlib import Path
+                    val_outputs = model(val_X).cpu().numpy().squeeze()
+                    val_preds = (val_outputs >= 0.5).astype(int)
 
-def train(config_path):
-    """Train OpenWakeWord model."""
-    with open(config_path) as f:
-        config = json.load(f)
+                    # Calculate metrics
+                    tp = np.sum((val_preds == 1) & (val_y == 1))
+                    fp = np.sum((val_preds == 1) & (val_y == 0))
+                    fn = np.sum((val_preds == 0) & (val_y == 1))
 
-    try:
-        # Try to use openwakeword's training utilities
-        from openwakeword.train import train_model
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
-        model_path = train_model(
-            wake_word=config["wake_word"],
-            positive_audio_paths=config["positive_samples"],
-            output_dir=config["output_dir"],
-            epochs=config.get("epochs", 100),
-            batch_size=config.get("batch_size", 32),
+                    print(f"[Training] Step {step}: Loss={loss.item():.4f}, "
+                          f"Recall={recall:.3f}, Precision={precision:.3f}, F1={f1:.3f}")
+
+                    # Save best model
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_model = copy.deepcopy(model.state_dict())
+
+                # Yield to event loop periodically
+                await asyncio.sleep(0)
+
+        # Load best model
+        if best_model is not None:
+            model.load_state_dict(best_model)
+            print(f"[Training] Loaded best model with F1={best_f1:.3f}")
+
+        return model
+
+    def _export_to_onnx(self, model: WakeWordDNN) -> Path:
+        """Export trained model to ONNX format."""
+        model.eval()
+        model.cpu()
+
+        # Sanitize wake word for output name
+        output_name = self.job.wake_word.replace(' ', '_').replace('-', '_')
+
+        # Output path
+        output_path = MODELS_DIR / f"{output_name}_{self.job.id[:8]}.onnx"
+
+        # Create dummy input
+        dummy_input = torch.randn(1, *INPUT_SHAPE)
+
+        # Export to ONNX
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            input_names=['input'],
+            output_names=[output_name],
+            dynamic_axes={'input': {0: 'batch_size'}},
+            opset_version=11,
         )
-        print(f"Model trained: {model_path}")
-        return model_path
 
-    except ImportError:
-        print("openwakeword.train not available")
-        # Training module not available in this version
-        sys.exit(1)
+        # Fix IR version for ARM64 compatibility
+        onnx_model = onnx.load(str(output_path))
+        onnx_model.ir_version = 6  # Required for ARM64 onnxruntime
+        onnx.save(onnx_model, str(output_path))
 
-    except Exception as e:
-        print(f"Training error: {e}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: train.py <config.json>")
-        sys.exit(1)
-    train(sys.argv[1])
-'''
-
-    async def _export_onnx(self, model_path: Path) -> Path:
-        """Export model to ONNX format if not already."""
-        if model_path.suffix == '.onnx':
-            # Already ONNX, copy to output
-            output_path = MODELS_DIR / f"{self.job.wake_word}_{self.job.id[:8]}.onnx"
-            shutil.copy(model_path, output_path)
-            return output_path
-
-        # Convert PyTorch to ONNX
-        output_path = MODELS_DIR / f"{self.job.wake_word}_{self.job.id[:8]}.onnx"
-
-        try:
-            import torch
-            model = torch.load(model_path)
-            dummy_input = torch.randn(1, 76, 32)
-            torch.onnx.export(
-                model,
-                dummy_input,
-                str(output_path),
-                input_names=['input'],
-                output_names=[self.job.wake_word],
-                dynamic_axes={'input': {0: 'batch'}}
-            )
-            return output_path
-
-        except Exception as e:
-            print(f"ONNX export error: {e}")
-            # If conversion fails, just copy the original
-            shutil.copy(model_path, output_path.with_suffix(model_path.suffix))
-            return output_path.with_suffix(model_path.suffix)
+        print(f"[Training] Model exported to {output_path}")
+        return output_path
 
     async def _cleanup(self):
         """Clean up temporary training files."""
@@ -451,4 +595,4 @@ if __name__ == "__main__":
             if self.work_dir.exists():
                 shutil.rmtree(self.work_dir)
         except Exception as e:
-            print(f"Cleanup error: {e}")
+            print(f"[Training] Cleanup error: {e}")
