@@ -18,3 +18,11 @@ dist/
 .env
 .env.local
 backend/venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data directories (recordings, models, etc.)
+backend/data/

@@ -17,8 +17,10 @@ for dir_path in [RECORDINGS_DIR, MODELS_DIR, TEMP_DIR, COMMUNITY_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
 # Recording settings
-MAX_RECORDING_AGE_HOURS = 24
-CLEANUP_INTERVAL_MINUTES = 60
+# Set MAX_RECORDING_AGE_HOURS to 0 or -1 to disable deletion (keep forever)
+# Examples: 1, 24, 72, 168 (1 week), 0 (never delete)
+MAX_RECORDING_AGE_HOURS = int(os.getenv("MAX_RECORDING_AGE_HOURS", "0"))  # Default: never delete
+CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60"))
 
 # Audio settings
 TARGET_SAMPLE_RATE = 16000

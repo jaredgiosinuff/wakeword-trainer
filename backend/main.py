@@ -95,8 +95,17 @@ def save_community_data():
 # ============================================================================
 
 async def cleanup_old_recordings():
-    """Remove recordings older than 24 hours."""
+    """Remove recordings older than MAX_RECORDING_AGE_HOURS.
+
+    If MAX_RECORDING_AGE_HOURS is 0 or negative, cleanup is disabled (keep forever).
+    """
     print(f"[{datetime.utcnow()}] Running cleanup job...")
+
+    # Skip cleanup if retention is disabled (0 or negative means keep forever)
+    if MAX_RECORDING_AGE_HOURS <= 0:
+        print(f"  Cleanup disabled (MAX_RECORDING_AGE_HOURS={MAX_RECORDING_AGE_HOURS})")
+        return
+
     cutoff = datetime.utcnow() - timedelta(hours=MAX_RECORDING_AGE_HOURS)
     sessions_to_remove = []
 

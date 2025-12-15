@@ -12,6 +12,8 @@ services:
       - wakeword-data:/app/data
     environment:
       - DATA_DIR=/app/data
+      # Recording retention: 0 = never delete, or hours (1, 24, 72, 168)
+      - MAX_RECORDING_AGE_HOURS=0
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8400/health"]
