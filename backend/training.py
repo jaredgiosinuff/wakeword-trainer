@@ -349,7 +349,7 @@ graph = helper.make_graph(
     [W, B]
 )
 
-model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 13)])
+model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 11)])  # Use opset 11 for broad compatibility
 model.producer_name = 'wakeword-trainer'
 
 onnx.save(model, '{model_path}')
