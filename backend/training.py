@@ -15,6 +15,7 @@ from typing import Callable, Optional
 import json
 import os
 
+import edge_tts
 import numpy as np
 import onnx
 import scipy.io.wavfile as wav
@@ -116,15 +117,29 @@ class TrainingPipeline:
 
             print(f"[Training] Collected {len(wav_files)} recordings")
 
-            # Step 2: Generate synthetic samples (optional)
-            if self.job.use_synthetic:
+            # Step 2: Generate synthetic samples based on percentage
+            if self.job.use_synthetic and self.job.synthetic_percentage > 0:
                 await self._update_progress(
                     progress_callback, 10,
                     "Generating synthetic voice samples..."
                 )
-                synthetic_files = await self._generate_synthetic_samples()
+                # Calculate how many synthetic samples to generate based on percentage
+                # If we have N user samples and want X% synthetic, we need:
+                # synthetic = (N * X) / (100 - X)
+                user_sample_count = len(wav_files)
+                percentage = min(self.job.synthetic_percentage, 80)  # Cap at 80%
+                if percentage > 0:
+                    synthetic_target = int((user_sample_count * percentage) / (100 - percentage))
+                    synthetic_target = max(synthetic_target, 5)  # At least 5 synthetic samples
+                else:
+                    synthetic_target = 0
+
+                synthetic_files = await self._generate_synthetic_samples(target_count=synthetic_target)
                 wav_files.extend(synthetic_files)
-                print(f"[Training] Added {len(synthetic_files)} synthetic samples")
+
+                actual_percentage = (len(synthetic_files) / (len(wav_files))) * 100 if wav_files else 0
+                print(f"[Training] Added {len(synthetic_files)} synthetic samples "
+                      f"({actual_percentage:.1f}% of total, target was {percentage}%)")
 
             # Step 3: Augment audio using existing audio_processor
             await self._update_progress(progress_callback, 20, "Augmenting audio samples...")
@@ -213,10 +228,228 @@ class TrainingPipeline:
 
         return wav_files
 
-    async def _generate_synthetic_samples(self) -> list[Path]:
-        """Generate synthetic TTS samples using Piper."""
+    async def _generate_synthetic_samples(self, target_count: int = 50) -> list[Path]:
+        """Generate synthetic TTS samples using edge-tts (Microsoft neural voices).
+
+        Args:
+            target_count: Target number of synthetic samples to generate
+
+        Returns:
+            List of paths to generated WAV files
+        """
         synthetic_files = []
         wake_word = self.job.wake_word
+
+        if target_count <= 0:
+            return synthetic_files
+
+        synthetic_dir = self.work_dir / "synthetic"
+        synthetic_dir.mkdir(exist_ok=True)
+
+        # Try edge-tts first (high quality Microsoft neural voices)
+        edge_files = await self._generate_edge_tts_samples(
+            wake_word, target_count, synthetic_dir
+        )
+        synthetic_files.extend(edge_files)
+
+        # If edge-tts didn't generate enough, fall back to Piper
+        remaining = target_count - len(synthetic_files)
+        if remaining > 0:
+            print(f"[Training] Edge-TTS generated {len(synthetic_files)}, trying Piper for {remaining} more")
+            piper_files = await self._generate_piper_samples(
+                wake_word, remaining, synthetic_dir
+            )
+            synthetic_files.extend(piper_files)
+
+        print(f"[Training] Total synthetic samples generated: {len(synthetic_files)}")
+        return synthetic_files
+
+    async def _generate_edge_tts_samples(
+        self,
+        wake_word: str,
+        target_count: int,
+        output_dir: Path
+    ) -> list[Path]:
+        """Generate samples using Microsoft Edge TTS (free neural voices).
+
+        Args:
+            wake_word: The wake word text to synthesize
+            target_count: Number of samples to generate
+            output_dir: Directory to save generated files
+
+        Returns:
+            List of paths to generated WAV files
+        """
+        synthetic_files = []
+
+        # High-quality Microsoft neural voices - diverse accents and genders
+        edge_voices = self._get_edge_tts_voices()
+        num_voices = min(self.job.synthetic_voices, len(edge_voices))
+        selected_voices = edge_voices[:num_voices]
+
+        # Calculate samples per voice
+        samples_per_voice = max(1, target_count // num_voices)
+        extra_samples = target_count % num_voices
+
+        print(f"[Training] Generating ~{target_count} samples using {num_voices} Edge-TTS voices")
+
+        for voice_idx, voice in enumerate(selected_voices):
+            voice_sample_count = samples_per_voice + (1 if voice_idx < extra_samples else 0)
+
+            for sample_idx in range(voice_sample_count):
+                if len(synthetic_files) >= target_count:
+                    break
+
+                output_mp3 = output_dir / f"edge_{voice_idx}_{sample_idx}.mp3"
+                output_wav = output_dir / f"edge_{voice_idx}_{sample_idx}_16k.wav"
+
+                try:
+                    # Generate audio with edge-tts
+                    communicate = edge_tts.Communicate(wake_word, voice)
+                    await communicate.save(str(output_mp3))
+
+                    if output_mp3.exists():
+                        # Convert to 16kHz mono WAV
+                        resample_cmd = [
+                            "ffmpeg", "-y",
+                            "-i", str(output_mp3),
+                            "-ar", str(TARGET_SAMPLE_RATE),
+                            "-ac", "1",
+                            str(output_wav)
+                        ]
+                        result = subprocess.run(
+                            resample_cmd, capture_output=True, timeout=10
+                        )
+
+                        if output_wav.exists():
+                            synthetic_files.append(output_wav)
+                            output_mp3.unlink()  # Remove temp mp3
+
+                except Exception as e:
+                    print(f"[Training] Edge-TTS error for voice {voice}: {e}")
+                    continue
+
+            if len(synthetic_files) >= target_count:
+                break
+
+        print(f"[Training] Edge-TTS generated {len(synthetic_files)} samples")
+        return synthetic_files
+
+    def _get_edge_tts_voices(self) -> list[str]:
+        """Get list of high-quality Microsoft Edge TTS voices.
+
+        Returns a curated list of English neural voices with diverse
+        accents (US, UK, AU, IN, etc.) and genders for training diversity.
+        """
+        return [
+            # US English - Female (various styles)
+            "en-US-JennyNeural",
+            "en-US-AriaNeural",
+            "en-US-SaraNeural",
+            "en-US-MichelleNeural",
+            "en-US-AmberNeural",
+            "en-US-AshleyNeural",
+            "en-US-CoraNeural",
+            "en-US-ElizabethNeural",
+            "en-US-JennyMultilingualNeural",
+            "en-US-MonicaNeural",
+            "en-US-NancyNeural",
+            # US English - Male (various styles)
+            "en-US-GuyNeural",
+            "en-US-DavisNeural",
+            "en-US-TonyNeural",
+            "en-US-JasonNeural",
+            "en-US-BrandonNeural",
+            "en-US-ChristopherNeural",
+            "en-US-EricNeural",
+            "en-US-JacobNeural",
+            "en-US-RogerNeural",
+            "en-US-SteffanNeural",
+            # UK English
+            "en-GB-SoniaNeural",
+            "en-GB-LibbyNeural",
+            "en-GB-MaisieNeural",
+            "en-GB-RyanNeural",
+            "en-GB-ThomasNeural",
+            "en-GB-AlfieNeural",
+            "en-GB-BellaNeural",
+            "en-GB-ElliotNeural",
+            "en-GB-EthanNeural",
+            "en-GB-HollieNeural",
+            "en-GB-NoahNeural",
+            "en-GB-OliverNeural",
+            "en-GB-OliviaNeural",
+            # Australian English
+            "en-AU-NatashaNeural",
+            "en-AU-WilliamNeural",
+            "en-AU-AnnetteNeural",
+            "en-AU-CarlyNeural",
+            "en-AU-DarrenNeural",
+            "en-AU-DuncanNeural",
+            "en-AU-ElsieNeural",
+            "en-AU-FreyaNeural",
+            "en-AU-JoanneNeural",
+            "en-AU-KenNeural",
+            "en-AU-KimNeural",
+            "en-AU-NeilNeural",
+            "en-AU-TimNeural",
+            # Indian English
+            "en-IN-NeerjaNeural",
+            "en-IN-PrabhatNeural",
+            "en-IN-AaravNeural",
+            "en-IN-AnanyaNeural",
+            "en-IN-KavyaNeural",
+            "en-IN-KunalNeural",
+            "en-IN-RehaanNeural",
+            # Irish English
+            "en-IE-EmilyNeural",
+            "en-IE-ConnorNeural",
+            # Canadian English
+            "en-CA-ClaraNeural",
+            "en-CA-LiamNeural",
+            # New Zealand English
+            "en-NZ-MollyNeural",
+            "en-NZ-MitchellNeural",
+            # South African English
+            "en-ZA-LeahNeural",
+            "en-ZA-LukeNeural",
+            # Kenyan English
+            "en-KE-AsiliaNeural",
+            "en-KE-ChilembaNeural",
+            # Nigerian English
+            "en-NG-AbeoNeural",
+            "en-NG-EzinneNeural",
+            # Philippines English
+            "en-PH-RosaNeural",
+            "en-PH-JamesNeural",
+            # Singapore English
+            "en-SG-LunaNeural",
+            "en-SG-WayneNeural",
+            # Hong Kong English
+            "en-HK-SamNeural",
+            "en-HK-YanNeural",
+        ]
+
+    async def _generate_piper_samples(
+        self,
+        wake_word: str,
+        target_count: int,
+        output_dir: Path
+    ) -> list[Path]:
+        """Generate samples using Piper TTS (fallback).
+
+        Args:
+            wake_word: The wake word text to synthesize
+            target_count: Number of samples to generate
+            output_dir: Directory to save generated files
+
+        Returns:
+            List of paths to generated WAV files
+        """
+        synthetic_files = []
+
+        if target_count <= 0:
+            return synthetic_files
 
         try:
             # Check if piper is available
@@ -227,17 +460,28 @@ class TrainingPipeline:
             )
 
             if piper_check.returncode != 0:
-                print("[Training] Piper TTS not available, skipping synthetic generation")
+                print("[Training] Piper TTS not available")
                 return synthetic_files
 
-            # Generate samples with different voices
-            voice_models = self._get_available_piper_voices()
-            synthetic_dir = self.work_dir / "synthetic"
-            synthetic_dir.mkdir(exist_ok=True)
+            # Get available voices
+            all_voices = self._get_available_piper_voices()
+            num_voices = min(self.job.synthetic_voices, len(all_voices))
+            voice_models = all_voices[:num_voices]
 
-            for voice_idx, voice_model in enumerate(voice_models[:self.job.synthetic_voices]):
-                for sample_idx in range(SYNTHETIC_SAMPLES_PER_VOICE):
-                    output_path = synthetic_dir / f"synthetic_{voice_idx}_{sample_idx}.wav"
+            samples_per_voice = max(1, target_count // num_voices)
+            extra_samples = target_count % num_voices
+
+            print(f"[Training] Generating ~{target_count} samples using {num_voices} Piper voices")
+
+            for voice_idx, voice_model in enumerate(voice_models):
+                voice_sample_count = samples_per_voice + (1 if voice_idx < extra_samples else 0)
+
+                for sample_idx in range(voice_sample_count):
+                    if len(synthetic_files) >= target_count:
+                        break
+
+                    output_path = output_dir / f"piper_{voice_idx}_{sample_idx}.wav"
+                    final_path = output_dir / f"piper_{voice_idx}_{sample_idx}_16k.wav"
 
                     cmd = [
                         "piper",
@@ -255,8 +499,6 @@ class TrainingPipeline:
                         proc.communicate(input=wake_word.encode(), timeout=30)
 
                         if output_path.exists():
-                            # Ensure correct format
-                            final_path = synthetic_dir / f"synth_{voice_idx}_{sample_idx}_16k.wav"
                             resample_cmd = [
                                 "ffmpeg", "-y",
                                 "-i", str(output_path),
@@ -271,23 +513,62 @@ class TrainingPipeline:
                                 output_path.unlink()
 
                     except Exception as e:
-                        print(f"[Training] Synthetic generation error: {e}")
+                        print(f"[Training] Piper error for {voice_model}: {e}")
                         continue
 
+                if len(synthetic_files) >= target_count:
+                    break
+
+            print(f"[Training] Piper generated {len(synthetic_files)} samples")
+
         except Exception as e:
-            print(f"[Training] Piper not available or error: {e}")
+            print(f"[Training] Piper not available: {e}")
 
         return synthetic_files
 
     def _get_available_piper_voices(self) -> list[str]:
-        """Get list of available Piper voice models."""
+        """Get list of available Piper voice models.
+
+        Returns a comprehensive list of English voices for training diversity.
+        Voices include different accents (US, UK, AU) and genders.
+        """
+        # Comprehensive list of English Piper voices for maximum diversity
+        # These are auto-downloaded by Piper when requested
         default_voices = [
-            "en_US-lessac-medium",
-            "en_US-libritts-high",
+            # US English - Female
             "en_US-amy-medium",
+            "en_US-amy-low",
+            "en_US-kathleen-low",
+            "en_US-lessac-medium",
+            "en_US-lessac-low",
+            "en_US-lessac-high",
+            "en_US-libritts-high",
+            "en_US-libritts_r-medium",
+            "en_US-ljspeech-medium",
+            "en_US-ljspeech-high",
+            # US English - Male
             "en_US-joe-medium",
+            "en_US-ryan-medium",
+            "en_US-ryan-low",
+            "en_US-ryan-high",
+            "en_US-arctic-medium",
+            # UK English
             "en_GB-alan-medium",
+            "en_GB-alan-low",
+            "en_GB-alba-medium",
+            "en_GB-aru-medium",
             "en_GB-cori-medium",
+            "en_GB-cori-high",
+            "en_GB-jenny_dioco-medium",
+            "en_GB-northern_english_male-medium",
+            "en_GB-semaine-medium",
+            "en_GB-southern_english_female-low",
+            "en_GB-vctk-medium",
+            # Australian English
+            "en_AU-lessac-medium",
+            # Other accents
+            "en-us-blizzard_lessac-medium",
+            "en-us-blizzard_lessac-high",
         ]
 
         available = []
@@ -295,10 +576,12 @@ class TrainingPipeline:
 
         if piper_models_dir.exists():
             for model_dir in piper_models_dir.iterdir():
-                if model_dir.is_dir():
+                if model_dir.is_dir() and model_dir.name.startswith("en"):
                     available.append(model_dir.name)
 
-        return available if available else default_voices
+        # Combine available with defaults, prioritizing available
+        all_voices = list(set(available + default_voices))
+        return all_voices
 
     async def _augment_samples(self, wav_files: list[Path]) -> list[Path]:
         """Augment audio samples for training diversity."""

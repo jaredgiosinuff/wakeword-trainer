@@ -60,7 +60,8 @@ class TrainingJob(BaseModel):
 
     # Training parameters
     use_synthetic: bool = True
-    synthetic_voices: int = 10
+    synthetic_percentage: int = 30  # Percentage of total samples that should be synthetic (0-80%)
+    synthetic_voices: int = 10  # Number of different voices to use
     augmentation_factor: int = 5
 
 
@@ -84,8 +85,9 @@ class SessionInfoResponse(BaseModel):
 
 class StartTrainingRequest(BaseModel):
     use_synthetic: bool = True
-    synthetic_voices: int = 10
-    augmentation_factor: int = 5
+    synthetic_percentage: int = Field(default=30, ge=0, le=80)  # 0-80% synthetic
+    synthetic_voices: int = Field(default=10, ge=1, le=50)  # Number of voices
+    augmentation_factor: int = Field(default=5, ge=1, le=20)
 
 
 class TrainingStatusResponse(BaseModel):

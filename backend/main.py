@@ -493,6 +493,7 @@ async def start_training(
         session_id=session_id,
         wake_word=session.wake_word,
         use_synthetic=request.use_synthetic,
+        synthetic_percentage=request.synthetic_percentage,
         synthetic_voices=request.synthetic_voices,
         augmentation_factor=request.augmentation_factor
     )
